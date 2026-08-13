@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "yugo-memory": {
+      "command": "python3",
+      "args": [
+        "./scripts/recall_mcp.py"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "YUGO_MEMORY_HOME",
+        "YUGO_MEMORY_ARCHIVE_DIR",
+        "YUGO_MEMORY_INDEX_DB"
+      ]
+    }
+  }
+}

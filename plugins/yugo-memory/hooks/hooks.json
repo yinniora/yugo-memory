@@ -1,0 +1,55 @@
+{
+  "description": "Event-driven long-conversation storage and recall.",
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/yugo-memory.mjs\" --background --quiet",
+            "timeout": 10,
+            "statusMessage": "Saving full long-conversation history"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/yugo-memory.mjs\" --background --quiet",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/compact-recall-context.mjs\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/yugo-memory.mjs\" --background --quiet",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/yugo-memory.mjs\" --background --quiet",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

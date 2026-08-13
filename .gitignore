@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+*.log
+*.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+coverage/
+work/
+__pycache__/
+*.pyc
