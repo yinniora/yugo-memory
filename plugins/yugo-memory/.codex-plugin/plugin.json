@@ -1,0 +1,37 @@
+{
+  "name": "yugo-memory",
+  "version": "1.0.0+codex.20260813164737",
+  "description": "Private, event-driven, full-fidelity conversation memory with calibrated local hybrid recall.",
+  "author": {
+    "name": "Yuguo",
+    "url": "https://github.com/yinniora"
+  },
+  "homepage": "https://github.com/yinniora/yugo-memory",
+  "repository": "https://github.com/yinniora/yugo-memory",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "memory",
+    "compaction",
+    "conversation",
+    "standalone",
+    "local-search"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Yugo Memory",
+    "shortDescription": "Preserve long conversations and recall exact evidence quickly.",
+    "longDescription": "Stores only conversations that cross Codex's compaction boundary, keeps raw JSONL as the source of truth, and combines exact-anchor lookup, multilingual FTS, multi-facet late interaction, LSH candidate generation, sparse graph expansion, evidence-set calibration, incremental indexing, and bounded raw verification without a server.",
+    "developerName": "Yuguo",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Show the current long-memory status.",
+      "Recall the exact decisions from our earlier long conversation."
+    ]
+  }
+}

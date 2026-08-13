@@ -1,0 +1,6 @@
+interface:
+  display_name: "Yugo Memory Auto Recall"
+  short_description: "Recall exact evidence from long or earlier chats"
+  default_prompt: "Use $yugo-memory-auto-recall to recover exact evidence from an earlier conversation."
+policy:
+  allow_implicit_invocation: true
