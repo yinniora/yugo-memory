@@ -11,7 +11,7 @@ from typing import Any
 from recall_index import default_paths, index_status, read_evidence, search_index, sync_index
 
 
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.2.0"
 
 
 def write_message(message: dict[str, Any]) -> None:
@@ -53,9 +53,11 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "read_evidence",
             "description": (
-                "Read an exact raw JSONL line range returned by recall without loading the entire "
-                "conversation archive. Safe for very large archives; paginate with offset_chars and "
-                "next_offset_chars. Only archives already present in the recall index are readable."
+                "Read a verified evidence range returned by recall without loading the entire conversation "
+                "archive. Use view=media for image/PDF/large-attachment turns: user/assistant text and media "
+                "tool events are read from raw JSONL while unrelated tool output and binary payloads are omitted. "
+                "Use view=text for all text fields and view=raw "
+                "when exact JSONL bytes are required. Paginate with offset_chars and next_offset_chars."
             ),
             "inputSchema": {
                 "type": "object",
@@ -65,6 +67,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "line_end": {"type": "integer", "minimum": 1},
                     "offset_chars": {"type": "integer", "minimum": 0, "default": 0},
                     "max_chars": {"type": "integer", "minimum": 1000, "maximum": 250000, "default": 60000},
+                    "view": {"type": "string", "enum": ["raw", "text", "media"], "default": "raw"},
                 },
                 "required": ["archive_path", "line_start", "line_end"],
                 "additionalProperties": False,
@@ -143,6 +146,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                     int(arguments.get("line_end", 0)),
                     int(arguments.get("offset_chars", 0)),
                     int(arguments.get("max_chars", 60_000)),
+                    str(arguments.get("view", "raw")),
                 )
             elif name == "recall":
                 query = arguments.get("query")

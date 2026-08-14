@@ -129,13 +129,15 @@ class RecallTests(unittest.TestCase):
 
     def test_status_exposes_new_index_capabilities_without_transcript_text(self) -> None:
         status = index_status(self.index_db)
-        self.assertEqual(status["schema_version"], 11)
+        self.assertEqual(status["schema_version"], 12)
         self.assertGreaterEqual(status["facets"], status["exchanges"])
         self.assertGreater(status["anchors"], 0)
         self.assertGreater(status["graph_edges"], 0)
         self.assertGreater(status["index_bytes"], 0)
         self.assertGreaterEqual(status["reclaimable_bytes"], 0)
         self.assertIn("late-interaction", status["retrieval_backend"])
+        self.assertEqual(status["evidence_views"], ["raw", "text", "media"])
+        self.assertIn("metadata-context-only", status["attachment_indexing"])
         self.assertNotIn("atlas-catalog-v7", json.dumps(status))
 
     def test_exact_anchor_bypasses_semantic_uncertainty(self) -> None:
@@ -326,7 +328,7 @@ class RecallTests(unittest.TestCase):
         db.commit()
         db.close()
         report = sync_index(self.archives, stale)
-        self.assertEqual(report["schema_version"], 11)
+        self.assertEqual(report["schema_version"], 12)
         self.assertGreater(report["nodes"]["exchange"], 0)
 
     def test_own_local_vector_route_is_used(self) -> None:
@@ -403,6 +405,8 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(names, {"recall", "read_evidence", "status"})
         recall = next(tool for tool in response["result"]["tools"] if tool["name"] == "recall")
         self.assertNotIn("dense_candidates", recall["inputSchema"]["properties"])
+        evidence = next(tool for tool in response["result"]["tools"] if tool["name"] == "read_evidence")
+        self.assertEqual(evidence["inputSchema"]["properties"]["view"]["enum"], ["raw", "text", "media"])
 
     def test_contextual_scale_anchors_require_more_evidence(self) -> None:
         with self.atlas.open("a", encoding="utf-8") as handle:
@@ -548,6 +552,203 @@ class RecallTests(unittest.TestCase):
         self.assertNotIn("A" * 2_048, stored)
         raw = read_evidence(self.index_db, str(archive.resolve()), 1, 4, 0, 30_000)
         self.assertIn("A" * 2_048, raw["raw_jsonl"])
+
+    def test_media_attachment_is_searchable_without_indexing_binary(self) -> None:
+        archive = self.archives / "2038" / "rollout-media-99999999-9999-4999-8999-999999999999.jsonl"
+        payload = "A" * 120_000
+        rows = [
+            {"type": "session_meta", "payload": {"id": "media-session"}},
+            {
+                "timestamp": "2038-01-15T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "比较紫鸢花季度图表与报告。"},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{payload}", "detail": "high"},
+                        {
+                            "type": "input_file",
+                            "file_path": "/demo/fictional/purple-iris-quarterly.pdf",
+                            "mime_type": "application/pdf",
+                            "text": "PDF提取文本：紫鸢花样本总量为 417。",
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "与附件无关的冗长工具日志 " + ("C" * 100_000),
+                },
+            },
+            message(
+                "assistant",
+                "图表与PDF一致，紫鸢花样本总量为 417；没有证据支持其他月份。",
+                "2038-01-15T00:00:00Z",
+            ),
+        ]
+        archive.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        sync_index(self.archives, self.index_db)
+        db = sqlite3.connect(self.index_db)
+        stored = db.execute(
+            "select user_message from exchanges where session_id='media-session'"
+        ).fetchone()[0]
+        db.close()
+        self.assertIn("kind=image 图片", stored)
+        self.assertIn("mime=application/pdf", stored)
+        self.assertIn("name=purple-iris-quarterly.pdf", stored)
+        self.assertIn("紫鸢花样本总量为 417", stored)
+        self.assertNotIn("A" * 2_048, stored)
+
+        recalled = search_index(self.index_db, "purple-iris-quarterly.pdf 紫鸢花样本总量", mode="auto")
+        self.assertTrue(recalled["safe_to_answer"])
+        self.assertEqual(recalled["results"][0]["session_id"], "media-session")
+
+        text_view = read_evidence(
+            self.index_db, str(archive.resolve()), 2, 4, 0, 20_000, "media",
+        )
+        self.assertTrue(text_view["complete"])
+        self.assertTrue(text_view["raw_verified_at_read_time"])
+        self.assertTrue(text_view["opaque_attachment_payloads_omitted"])
+        self.assertTrue(text_view["non_media_tool_events_omitted"])
+        self.assertIn("比较紫鸢花季度图表与报告", text_view["evidence_text"])
+        self.assertIn("encoded_sha256=", text_view["evidence_text"])
+        self.assertIn("图表与PDF一致", text_view["evidence_text"])
+        self.assertNotIn("与附件无关的冗长工具日志", text_view["evidence_text"])
+        self.assertNotIn("A" * 2_048, text_view["evidence_text"])
+
+        raw_view = read_evidence(
+            self.index_db, str(archive.resolve()), 2, 2, 0, 250_000, "raw",
+        )
+        self.assertIn("A" * 2_048, raw_view["raw_jsonl"])
+
+    def test_duplicate_pdf_filename_uses_context_for_reranking(self) -> None:
+        filename = "shared-synthetic-report.pdf"
+        first = self.archives / "2038" / "rollout-pdf-one-56565656-5656-4656-8656-565656565656.jsonl"
+        second = self.archives / "2038" / "rollout-pdf-two-78787878-7878-4878-8878-787878787878.jsonl"
+        write_archive(
+            first,
+            "pdf-one-session",
+            [("p1", f"读取 /demo/fictional/{filename} 的银杏章节。", "银杏结论编号 ginkgo-144。")],
+        )
+        write_archive(
+            second,
+            "pdf-two-session",
+            [("p2", f"读取 /demo/fictional/{filename} 的雪松章节。", "雪松结论编号 cedar-288。")],
+        )
+        sync_index(self.archives, self.index_db)
+        result = search_index(
+            self.index_db,
+            f"/demo/fictional/{filename} 雪松章节的结论",
+            mode="auto",
+            limit=5,
+        )
+        self.assertTrue(result["safe_to_answer"])
+        self.assertEqual(result["results"][0]["session_id"], "pdf-two-session")
+        self.assertIn("exact-anchor-context-rerank", result["results"][0]["routes"])
+
+    def test_oversized_image_event_keeps_prompt_and_streaming_fingerprint(self) -> None:
+        archive = self.archives / "2038" / "rollout-giant-media-12121212-1212-4212-8212-121212121212.jsonl"
+        giant_payload = "B" * (9 * 1024 * 1024)
+        rows = [
+            {"type": "session_meta", "payload": {"id": "giant-media-session"}},
+            {
+                "timestamp": "2038-01-16T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "检查巨型琥珀星图附件。"},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{giant_payload}"},
+                    ],
+                },
+            },
+            message("assistant", "巨型琥珀星图已检查，编号为 amber-map-812。", "2038-01-16T00:00:00Z"),
+        ]
+        archive.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        sync_index(self.archives, self.index_db)
+        db = sqlite3.connect(self.index_db)
+        stored = db.execute(
+            "select user_message from exchanges where session_id='giant-media-session'"
+        ).fetchone()[0]
+        db.close()
+        self.assertIn("检查巨型琥珀星图附件", stored)
+        self.assertIn("storage=oversized-inline", stored)
+        self.assertIn("raw_event_sha256=", stored)
+        self.assertNotIn("B" * 2_048, stored)
+        recalled = search_index(self.index_db, "巨型琥珀星图 amber-map-812", mode="auto")
+        self.assertTrue(recalled["safe_to_answer"])
+        self.assertEqual(recalled["results"][0]["session_id"], "giant-media-session")
+        text_view = read_evidence(
+            self.index_db, str(archive.resolve()), 2, 3, 0, 20_000, "media",
+        )
+        self.assertTrue(text_view["complete"])
+        self.assertIn("raw_sha256=", text_view["evidence_text"])
+        self.assertIn("amber-map-812", text_view["evidence_text"])
+        self.assertNotIn("B" * 2_048, text_view["evidence_text"])
+
+    def test_missing_attachment_content_does_not_become_answerable(self) -> None:
+        result = search_index(
+            self.index_db,
+            "不存在的青铜海燕PDF中第77页的精确结论是什么",
+            mode="deep",
+            limit=8,
+        )
+        self.assertEqual(result["answerability"], "insufficient_evidence")
+        self.assertFalse(result["safe_to_answer"])
+
+    def test_media_view_deduplicates_and_caps_screenshot_streams(self) -> None:
+        archive = self.archives / "2038" / "rollout-media-stream-34343434-3434-4434-8434-343434343434.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "media-stream-session"}},
+            message("user", "检查虚构浏览器截图流。", "2038-01-17T00:00:00Z"),
+        ]
+        for number in range(20):
+            rows.append({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{str(number).zfill(2) + ('D' * 3_000)}",
+                    },
+                },
+            })
+        rows.append(message(
+            "assistant",
+            "HEAD-EVIDENCE 截图流检查开始。" + ("middle evidence phrase " * 1_000) + "TAIL-EVIDENCE 最终状态为 synthetic-green。",
+            "2038-01-17T00:00:00Z",
+        ))
+        archive.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        sync_index(self.archives, self.index_db)
+        view = read_evidence(
+            self.index_db, str(archive.resolve()), 2, 23, 0, 60_000, "media",
+        )
+        self.assertTrue(view["complete"])
+        self.assertEqual(view["media_tool_event_limit"], 8)
+        self.assertEqual(view["additional_media_tool_events_omitted"], 12)
+        self.assertEqual(view["media_text_events_compacted"], 1)
+        self.assertFalse(view["text_fields_are_verbatim"])
+        self.assertTrue(view["returned_text_segments_are_verbatim"])
+        self.assertIn("additional media-bearing tool events omitted", view["evidence_text"])
+        self.assertIn("HEAD-EVIDENCE", view["evidence_text"])
+        self.assertIn("TAIL-EVIDENCE", view["evidence_text"])
+        self.assertIn("full_text_sha256=", view["evidence_text"])
+        self.assertIn("synthetic-green", view["evidence_text"])
+        self.assertNotIn("middle evidence phrase " * 500, view["evidence_text"])
+        self.assertNotIn(";base64,", view["evidence_text"])
 
     def test_public_runtime_has_no_upstream_memory_invocation(self) -> None:
         runtime_files = [
