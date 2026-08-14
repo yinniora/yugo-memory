@@ -11,7 +11,7 @@ from typing import Any
 from recall_index import default_paths, index_status, read_evidence, search_index, sync_index
 
 
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 
 
 def write_message(message: dict[str, Any]) -> None:
@@ -26,7 +26,8 @@ def tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Recall exact evidence from long Codex conversations with calibrated local hybrid retrieval: "
                 "direct anchors, multilingual session/episode routing, multi-facet late interaction, LSH, "
-                "sparse graph expansion, diverse evidence sets, deduplication, and raw-line anchors. Use after compaction or whenever older exact "
+                "sparse graph expansion, diverse evidence sets, deduplication, typed file descriptors, "
+                "visible tool/code/command evidence nodes, and raw-line anchors. Use after compaction or whenever older exact "
                 "decisions, commands, paths, results, or constraints matter. Read returned raw ranges "
                 "with this server's bounded read_evidence tool before relying on details. No upstream "
                 "memory plugin or remote server is used."
@@ -56,7 +57,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "Read a verified evidence range returned by recall without loading the entire conversation "
                 "archive. Use view=media for image/PDF/large-attachment turns: user/assistant text and media "
                 "tool events are read from raw JSONL while unrelated tool output and binary payloads are omitted. "
-                "Use view=text for all text fields and view=raw "
+                "Use view=text for all visible text fields, including paginated tool commands/code/results, and view=raw "
                 "when exact JSONL bytes are required. Paginate with offset_chars and next_offset_chars."
             ),
             "inputSchema": {
