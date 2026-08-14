@@ -1,6 +1,6 @@
 {
   "name": "yugo-memory",
-  "version": "1.2.0+codex.20260814044057",
+  "version": "1.3.0+codex.20260814052323",
   "description": "Private, event-driven, full-fidelity conversation memory with calibrated local hybrid recall.",
   "author": {
     "name": "Yuguo",
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "Yugo Memory",
     "shortDescription": "Preserve long conversations and recall exact evidence quickly.",
-    "longDescription": "Stores only conversations that cross Codex's compaction boundary, keeps raw JSONL as the source of truth, and combines exact-anchor lookup, multilingual FTS, multi-facet late interaction, LSH and graph routing, attachment-aware indexing, calibrated evidence selection, incremental indexing, and bounded raw or text verification without a server.",
+    "longDescription": "Stores only conversations that cross Codex's compaction boundary, keeps raw JSONL as the source of truth, and combines exact-anchor lookup, multilingual FTS, multi-facet late interaction, LSH and graph routing, all-file descriptors, visible tool/code/command evidence indexing, calibrated evidence selection, incremental indexing, and bounded raw or text verification without a server.",
     "developerName": "Yuguo",
     "category": "Productivity",
     "capabilities": [

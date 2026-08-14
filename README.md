@@ -4,7 +4,7 @@ Standalone, event-driven, full-fidelity long-conversation memory for Codex.
 
 It indexes a conversation only after Codex emits a real context-compaction event. Codex's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session for lifecycle safety; session routes, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
-Yugo Memory 1.2 is a separately named and owned implementation. It has no upstream memory runtime, remote server, API key, model download, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Yugo Memory 1.3 is a separately named and owned implementation. It has no upstream memory runtime, remote server, API key, model download, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
 
 ## Behavior
 
@@ -37,7 +37,7 @@ The engine uses several complementary resolutions instead of one rigid hierarchy
 
 1. Session routes are the fast map across long tasks.
 2. Compaction-era episodes narrow the relevant part of a task.
-3. Exchange nodes point to exact raw line ranges.
+3. Exchange nodes and visible tool-evidence nodes point to exact raw line ranges.
 4. User, assistant, clause, and anchor facets preserve short exact facts that a long exchange-level vector can dilute.
 5. Locality-sensitive hashing generates a bounded vector candidate pool; exact reranking happens afterward.
 6. A sparse graph connects adjacent turns, chunks of one exchange, and exchanges sharing decisive identifiers.
@@ -53,14 +53,15 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 
 `read_evidence` reads only an indexed line range with a strict character budget. Raw view returns exact JSONL; text view returns all human-visible text fields; media view keeps user/assistant text and media-bearing tool events while skipping unrelated bulky tool output. Both derived views re-read the verified JSONL and replace large media payloads with bounded metadata. No mode loads the archive—or even one giant JSONL line—into a single string. Seek prefixes are checked before reading, pagination is explicit, append-only growth is allowed, and rewritten history fails closed.
 
-## Large attachments
+## Files, commands, code, and tool evidence
 
-- Images, PDFs, office documents, audio, and video remain solely in Codex's raw JSONL or their original referenced path. Yugo Memory does not make a second media copy.
-- Search records contain only a bounded attachment descriptor: media kind, MIME type, filename when present, storage form, approximate byte count for ordinary inline payloads, and a stable digest.
+- Images, PDFs, Office files, audio/video, archives, datasets, databases, logs, source files, and model weights remain solely in Codex's raw JSONL or their original referenced path. Yugo Memory does not make a second file copy.
+- Search records contain only a typed descriptor: file kind, MIME type, filename when present, storage form, approximate byte count for ordinary inline payloads, and a stable digest. Known path suffixes and arbitrary typed MIME attachments are supported.
 - Attachment descriptors are indexed together with the user's question, any transcript-provided text/OCR, tool analysis, and the assistant's answer. This recalls *the conversation about an attachment* without pretending to understand media that was never analyzed.
-- Events above 8 MiB are streamed while hashing. Bounded prefix/suffix parsing recovers the role, prompt, media type, and full-event digest without constructing a giant string.
-- `read_evidence(view="media")` bypasses base64 and unrelated tool output, deduplicates repeated event copies, caps screenshot streams, and preserves exact leading/trailing excerpts plus a full-text digest for oversized messages. `view="text"` retains all text-bearing events, and `view="raw"` remains available for byte-exact JSONL paging.
-- A filename or attachment marker is never evidence for unseen pixels, pages, audio, or document content. When no OCR, extracted text, or tool analysis exists, recall must abstain.
+- Every visible tool call/result is indexed independently: tool name, arguments, terminal commands, code, patches, paths, and textual results are chunked without the exchange-summary limit. Hidden/encrypted reasoning and opaque binary fields are excluded.
+- Events above 8 MiB are streamed while hashing. A bounded lexical-anchor sketch provides navigation to identifiers and paths in the middle of giant tool events; the complete event remains only in raw storage.
+- `read_evidence(view="media")` bypasses base64 and unrelated tool output, deduplicates repeated event copies, caps screenshot streams, and preserves exact leading/trailing excerpts plus a full-text digest for oversized messages. Paginated `view="text"` retains every visible text field for ordinary events, including long commands/code/results; `view="raw"` remains available for byte-exact JSONL paging.
+- A filename or attachment marker is never evidence for unseen pixels, pages, audio, archive members, database rows, tensors, or document content. When no extracted text or tool analysis exists, recall must abstain.
 
 ## Canonical storage and incremental indexing
 
@@ -75,7 +76,7 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 - Opaque base64/data-URL/hex payloads remain available in raw evidence but are replaced by typed, bounded attachment descriptors in navigation records, preventing images and binary tool output from inflating the index.
 - Codex compaction summaries improve routing but never replace raw evidence.
 - A one-time legacy import can recover the most complete compacted evidence from prior local memory roots. It is immediately canonicalized; no legacy executable, database, MCP, or vector service is called.
-- SQLite schema v12 uses `WITHOUT ROWID` for key-heavy retrieval tables, incremental auto-vacuum, optimizer statistics, and media-aware parser invalidation to reduce index amplification while safely rebuilding older navigation records.
+- SQLite schema v13 uses `WITHOUT ROWID` for key-heavy retrieval tables, incremental auto-vacuum, optimizer statistics, all-file descriptors, and independent visible-tool evidence nodes while safely rebuilding older navigation records.
 
 ## Install
 
@@ -142,7 +143,7 @@ The plugin recognizes `type=compacted` and `event_msg/context_compacted`. Codex 
 
 Published releases contain no private query, expected phrase, transcript path, real-history fixture, or aggregate claim derived from a private conversation. Public CI uses independently invented fixtures only.
 
-The public regression suite covers lifecycle storage/deletion, migration, earliest/latest/Nth turns, exact paths and commits, CJK/English retrieval, role-preserving late interaction, LSH and graph routes, multi-range support, ambiguous numeric anchors, duplicates, prompt injection, append-only updates, rewritten-history rejection, unavailable evidence, MCP behavior, ordinary and oversized media events, attachment abstention, and bounded reads including a sparse 600 MiB JSONL line.
+The public regression suite covers lifecycle storage/deletion, migration, earliest/latest/Nth turns, exact paths and commits, CJK/English retrieval, role-preserving late interaction, LSH and graph routes, multi-range support, ambiguous numeric anchors, duplicates, prompt injection, append-only updates, rewritten-history rejection, unavailable evidence, MCP behavior, all major file families, ordinary and oversized media/tool events, full long-command/code/patch recall, attachment abstention, and bounded reads including a sparse 600 MiB JSONL line.
 
 Hybrid retrieval moves work from query time into indexing. Compared with the previous standalone implementation, Yugo Memory stores additional facets, anchor postings, LSH buckets, and sparse graph edges. This improves recall and refusal behavior but increases initial build time and index size. Incremental checkpoints, bounded facets, and candidate generation keep later updates and queries controlled; exact identifiers and provably absent stable identifiers use the direct index instead of the full cascade.
 

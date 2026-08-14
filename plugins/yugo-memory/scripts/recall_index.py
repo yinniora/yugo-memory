@@ -20,6 +20,7 @@ from archive_parser import (
     Exchange,
     ParserState,
     evidence_text_from_row,
+    iter_tool_evidence,
     iter_bounded_lines,
     oversized_evidence_text,
     parse_increment,
@@ -46,7 +47,7 @@ from retrieval_layers import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 EPISODE_EXCHANGES = 10
 EPISODE_OVERLAP = 2
 EXCHANGE_CHARS = 12_000
@@ -500,6 +501,44 @@ def _build_file_nodes(
                 (anchor, node_id, 1)
                 for anchor in stable_anchors
             )
+    # Tool calls/results are separate navigation nodes. This prevents a long
+    # command, patch, log, or tool result from disappearing behind the compact
+    # assistant-message budget while the raw JSONL remains the source of truth.
+    for evidence in iter_tool_evidence(Path(archive_path), session_id):
+        parent = next(
+            (
+                row for row in reversed(rows)
+                if row["line_start"] <= evidence.line_number <= row["line_end"]
+            ),
+            rows[-1],
+        )
+        digest = hashlib.sha256(
+            f"{archive_path}:{evidence.line_number}:{evidence.ordinal}:{evidence.raw_sha256}".encode("utf-8")
+        ).hexdigest()[:32]
+        node_id = f"exchange:tool:{digest}"
+        node_tuple = _node(
+            node_id, "exchange", session_id, archive_path,
+            f"exchange:{parent['id']}:000", evidence.line_number, evidence.line_number,
+            evidence.timestamp or parent["timestamp"], parent["project"] or "",
+            parent["cwd"] or "", parent["git_branch"] or "", evidence.text, 2200,
+        )
+        nodes.append(node_tuple)
+        all_anchors, decisive_anchors = anchor_sets(evidence.text)
+        decisive = set(decisive_anchors)
+        direct_tool_anchors = {
+            normalize_text(anchor) for anchor in evidence.routing_anchors
+        }
+        combined_tool_anchors = {
+            anchor for anchor in all_anchors
+            if anchor in decisive and indexable_anchor(anchor)
+        } | {
+            anchor for anchor in direct_tool_anchors
+            if indexable_anchor(anchor)
+        }
+        anchors.extend(
+            (anchor, node_id, 1)
+            for anchor in combined_tool_anchors
+        )
     return nodes, facets, anchors
 
 
@@ -1688,6 +1727,9 @@ def index_status(index_path: Path) -> dict[str, Any]:
     facets = db.execute("SELECT count(*) FROM node_facets").fetchone()[0]
     anchors = db.execute("SELECT count(*) FROM node_anchors").fetchone()[0]
     edges = db.execute("SELECT count(*) FROM node_edges").fetchone()[0]
+    tool_evidence_nodes = db.execute(
+        "SELECT count(*) FROM nodes WHERE id LIKE 'exchange:tool:%'"
+    ).fetchone()[0]
     page_size = db.execute("PRAGMA page_size").fetchone()[0]
     page_count = db.execute("PRAGMA page_count").fetchone()[0]
     freelist_count = db.execute("PRAGMA freelist_count").fetchone()[0]
@@ -1701,11 +1743,13 @@ def index_status(index_path: Path) -> dict[str, Any]:
         "facets": facets,
         "anchors": anchors,
         "graph_edges": edges,
+        "tool_evidence_nodes": tool_evidence_nodes,
         "index_bytes": page_size * page_count,
         "reclaimable_bytes": page_size * freelist_count,
         "schema_version": SCHEMA_VERSION,
         "retrieval_backend": "yugo-local-hybrid-late-interaction-lsh-graph-v1",
-        "attachment_indexing": "metadata-context-only; binary remains in raw Codex JSONL",
+        "attachment_indexing": "typed metadata/context only; binary remains in raw Codex JSONL",
+        "tool_evidence_indexing": "visible calls/arguments/commands/code/patches/results; hidden reasoning excluded",
         "evidence_views": ["raw", "text", "media"],
         "metadata": metadata,
         "runtime_dependency": "none",

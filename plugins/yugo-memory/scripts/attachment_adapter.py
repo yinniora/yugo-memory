@@ -25,10 +25,12 @@ DATA_URL_MIME_RE = re.compile(
     r"data:(?P<mime>[a-z0-9.+-]+/[a-z0-9.+-]+)(?:;[^,]*)*;base64,",
     re.IGNORECASE,
 )
-MEDIA_REFERENCE_RE = re.compile(
+FILE_REFERENCE_RE = re.compile(
     r"(?P<reference>(?:(?:https?|file)://|/)[^\s<>'\"\]\[()]{1,1900}?"
     r"\.(?:pdf|png|jpe?g|gif|webp|bmp|tiff?|svg|heic|avif|mp3|wav|m4a|flac|ogg|mp4|mov|mkv|webm|avi|"
-    r"docx?|pptx?|xlsx?)(?:[?#][^\s<>'\"\]\[()]*)?)",
+    r"docx?|pptx?|xlsx?|zip|tar(?:\.gz|\.bz2|\.xz|\.zst)?|tgz|gz|bz2|xz|zst|7z|rar|jsonl?|ya?ml|toml|csv|tsv|parquet|arrow|"
+    r"txt|md|rst|log|py|js|mjs|cjs|ts|tsx|jsx|java|go|rs|c|cc|cpp|h|hpp|sh|zsh|bash|fish|sqlite3?|sql|"
+    r"safetensors|pt|pth|ckpt|onnx|gguf|npy|npz|bin|db|pem|crt)(?![A-Za-z0-9.])(?:[?#][^\s<>'\"\]\[()]*)?)",
     re.IGNORECASE,
 )
 MEDIA_KEYS = {
@@ -65,11 +67,48 @@ EXTENSION_KIND = {
     ".pptx": ("document", "演示文稿", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
     ".xls": ("document", "表格", "application/vnd.ms-excel"),
     ".xlsx": ("document", "表格", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ".zip": ("archive", "压缩包", "application/zip"),
+    ".tar": ("archive", "压缩包", "application/x-tar"),
+    ".tgz": ("archive", "压缩包", "application/gzip"),
+    ".gz": ("archive", "压缩包", "application/gzip"),
+    ".bz2": ("archive", "压缩包", "application/x-bzip2"),
+    ".xz": ("archive", "压缩包", "application/x-xz"),
+    ".zst": ("archive", "压缩包", "application/zstd"),
+    ".7z": ("archive", "压缩包", "application/x-7z-compressed"),
+    ".rar": ("archive", "压缩包", "application/vnd.rar"),
+    ".json": ("data", "数据文件", "application/json"),
+    ".jsonl": ("data", "数据文件", "application/x-ndjson"),
+    ".csv": ("data", "数据文件", "text/csv"),
+    ".tsv": ("data", "数据文件", "text/tab-separated-values"),
+    ".parquet": ("data", "数据文件", "application/vnd.apache.parquet"),
+    ".arrow": ("data", "数据文件", "application/vnd.apache.arrow.file"),
+    ".sqlite": ("database", "数据库", "application/vnd.sqlite3"),
+    ".sqlite3": ("database", "数据库", "application/vnd.sqlite3"),
+    ".db": ("database", "数据库", "application/octet-stream"),
+    ".safetensors": ("model", "模型权重", "application/octet-stream"),
+    ".pt": ("model", "模型权重", "application/octet-stream"),
+    ".pth": ("model", "模型权重", "application/octet-stream"),
+    ".ckpt": ("model", "模型权重", "application/octet-stream"),
+    ".onnx": ("model", "模型权重", "application/onnx"),
+    ".gguf": ("model", "模型权重", "application/octet-stream"),
+    ".npy": ("data", "数据文件", "application/octet-stream"),
+    ".npz": ("data", "数据文件", "application/octet-stream"),
+    ".bin": ("binary", "二进制文件", "application/octet-stream"),
+}
+
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".rst", ".log", ".yaml", ".yml", ".toml", ".py", ".js", ".mjs",
+    ".cjs", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".sh", ".zsh", ".bash", ".fish", ".sql", ".pem", ".crt",
 }
 
 
 def _kind_for_mime(mime: str) -> tuple[str, str]:
     value = mime.lower()
+    if value in {"application/zip", "application/gzip", "application/x-tar", "application/zstd"}:
+        return "archive", "压缩包"
+    if any(token in value for token in ("parquet", "arrow", "ndjson", "sqlite")):
+        return "data", "数据文件"
     if value == "application/pdf" or value.startswith("application/"):
         return "document", "文档"
     if value.startswith("image/"):
@@ -78,6 +117,10 @@ def _kind_for_mime(mime: str) -> tuple[str, str]:
         return "audio", "音频"
     if value.startswith("video/"):
         return "video", "视频"
+    if value.startswith("text/"):
+        return "text", "文本文件"
+    if value.startswith("model/"):
+        return "model", "模型文件"
     return "file", "文件"
 
 
@@ -118,6 +161,8 @@ def _descriptor_for_reference(reference: str, declared_mime: str = "") -> str | 
     name = _basename(reference)
     suffix = PurePosixPath(name.lower()).suffix
     detected = EXTENSION_KIND.get(suffix)
+    if not detected and suffix in TEXT_SUFFIXES:
+        detected = ("text", "文本/代码", "text/plain")
     if not detected and not declared_mime:
         return None
     if declared_mime:
@@ -152,7 +197,7 @@ def attachment_descriptors(value: Any) -> list[str]:
                 return
             if key in MEDIA_KEYS:
                 add(_descriptor_for_reference(item, declared_mime))
-            for match in MEDIA_REFERENCE_RE.finditer(item[:MAX_REFERENCE_CHARS * 4]):
+            for match in FILE_REFERENCE_RE.finditer(item[:MAX_REFERENCE_CHARS * 4]):
                 add(_descriptor_for_reference(match.group("reference")))
             return
         if isinstance(item, list):
@@ -193,7 +238,7 @@ def oversized_attachment_descriptors(
         if descriptor not in seen:
             seen.add(descriptor)
             output.append(descriptor)
-    for match in MEDIA_REFERENCE_RE.finditer(preview):
+    for match in FILE_REFERENCE_RE.finditer(preview):
         descriptor = _descriptor_for_reference(match.group("reference"))
         if descriptor and descriptor not in seen:
             seen.add(descriptor)

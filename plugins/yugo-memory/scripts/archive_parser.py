@@ -57,6 +57,7 @@ class RawLine:
     raw_sha256: str
     raw_bytes: int
     oversized: bool
+    lexical_sketch: str = ""
 
 
 @dataclass
@@ -73,6 +74,22 @@ class Exchange:
     cwd: str
     git_branch: str
     turn_kind: str
+
+
+@dataclass
+class ToolEvidence:
+    """Searchable locator for visible tool/code/command evidence in one raw event."""
+
+    archive_path: str
+    session_id: str
+    timestamp: str
+    line_number: int
+    ordinal: int
+    tool_kind: str
+    tool_name: str
+    text: str
+    raw_sha256: str
+    routing_anchors: tuple[str, ...] = ()
 
 
 @dataclass
@@ -114,6 +131,23 @@ def _navigation_safe_text(value: str) -> str:
     value = DATA_URL_RE.sub(marker, value)
     value = OPAQUE_TOKEN_RE.sub(marker, value)
     return OPAQUE_HEX_RE.sub(marker, value)
+
+
+LEXICAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9+/=])(?:/[A-Za-z0-9_.@%:+~-]+(?:/[A-Za-z0-9_.@%:+~-]+)*|"
+    r"[A-Za-z_][A-Za-z0-9_.:@/+~-]{3,239}|[\u3400-\u9fff]{2,80})(?![A-Za-z0-9+/=])"
+)
+
+
+def _lexical_sketch_update(raw: bytes, terms: dict[str, None], carry: str = "") -> str:
+    """Collect bounded exact anchors without retaining an oversized JSON event."""
+
+    decoded = carry + raw.decode("utf-8", errors="ignore")
+    for match in LEXICAL_TOKEN_RE.finditer(decoded):
+        token = match.group(0)
+        if len(token) <= 240 and token not in terms and len(terms) < 8_000:
+            terms[token] = None
+    return decoded[-512:]
 
 
 def _bounded_append(existing: str, addition: str, limit: int = MAX_PENDING_TEXT_CHARS) -> str:
@@ -255,6 +289,7 @@ def iter_bounded_lines(
                 raw_sha256=hashlib.sha256(first).hexdigest(),
                 raw_bytes=len(first),
                 oversized=False,
+                lexical_sketch="",
             )
             number += 1
             continue
@@ -263,12 +298,15 @@ def iter_bounded_lines(
         suffix = bytearray(first[-OVERSIZED_PREVIEW_BYTES:])
         raw_digest = hashlib.sha256(first)
         raw_bytes = len(first)
+        lexical_terms: dict[str, None] = {}
+        lexical_carry = _lexical_sketch_update(first, lexical_terms)
         while not first.endswith(b"\n"):
             first = handle.readline(READ_CHUNK_BYTES)
             if not first:
                 break
             raw_digest.update(first)
             raw_bytes += len(first)
+            lexical_carry = _lexical_sketch_update(first, lexical_terms, lexical_carry)
             suffix.extend(first)
             if len(suffix) > OVERSIZED_PREVIEW_BYTES:
                 del suffix[:-OVERSIZED_PREVIEW_BYTES]
@@ -284,6 +322,7 @@ def iter_bounded_lines(
             raw_sha256=raw_digest.hexdigest(),
             raw_bytes=raw_bytes,
             oversized=True,
+            lexical_sketch=" ".join(lexical_terms)[:MAX_EVENT_TEXT_CHARS],
         )
         number += 1
 
@@ -318,14 +357,177 @@ def _clean_user_text(text: str) -> tuple[str, str]:
 
 
 def _tool_text(row: dict[str, Any]) -> str:
-    if row.get("type") != "response_item":
-        return ""
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-    if payload.get("type") not in {
-        "custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output",
-    }:
+    payload, _tool_kind, _tool_name = _visible_tool_payload(row)
+    if payload is None:
         return ""
     return _text_fragments(payload)
+
+
+TOOL_PAYLOAD_TYPES = {
+    "custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output",
+    "local_shell_call", "local_shell_call_output", "computer_call", "computer_call_output",
+    "web_search_call", "web_search_call_output", "mcp_call", "mcp_call_output",
+    "apply_patch_call", "apply_patch_call_output",
+}
+TOOL_SKIP_KEYS = {
+    "encrypted_content", "internal_chat_message_metadata_passthrough", "metadata", "images",
+    "local_images", "audio", "local_audio", "video", "local_video", "blob", "bytes", "base64",
+}
+TOOL_CHUNK_CHARS = 12_000
+TOOL_NAVIGATION_CHARS = 32_000
+TOOL_LONG_FIELD_EDGE_CHARS = 4_000
+
+
+def _visible_tool_payload(row: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    if row.get("type") != "response_item":
+        return None, "", ""
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    payload_type = str(payload.get("type") or "")
+    visible = payload_type in TOOL_PAYLOAD_TYPES or (
+        any(token in payload_type for token in ("tool", "function", "shell", "computer", "patch"))
+        and any(token in payload_type for token in ("call", "output", "result"))
+    )
+    if not visible:
+        return None, "", ""
+    tool_name = str(payload.get("name") or payload.get("tool_name") or payload.get("command_name") or "")
+    return payload, payload_type or "tool", tool_name
+
+
+def _tool_string_chunks(value: Any) -> Iterator[str]:
+    """Yield every visible textual tool field; binary and hidden fields stay raw-only."""
+
+    descriptors = attachment_descriptors(value)
+    for descriptor in descriptors:
+        yield descriptor
+
+    def visit(item: Any, key: str = "", depth: int = 0) -> Iterator[str]:
+        if depth > 16:
+            return
+        if isinstance(item, str):
+            if item.startswith("data:") or is_opaque_attachment_key(key):
+                return
+            safe = _navigation_safe_text(item)
+            label = f"{key}: " if key and key not in {"text", "content", "output_text", "input_text"} else ""
+            for start in range(0, len(safe), TOOL_CHUNK_CHARS):
+                piece = safe[start:start + TOOL_CHUNK_CHARS]
+                if piece.strip():
+                    yield label + piece
+            return
+        if isinstance(item, list):
+            for child in item:
+                yield from visit(child, key, depth + 1)
+            return
+        if isinstance(item, dict):
+            for child_key, child in item.items():
+                if child_key in TOOL_SKIP_KEYS or child_key == "encrypted_content" or is_opaque_attachment_key(child_key):
+                    continue
+                yield from visit(child, child_key, depth + 1)
+
+    yield from visit(value)
+
+
+def _tool_navigation_text(payload: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Build one bounded locator that still scans every visible textual field."""
+
+    parts = list(attachment_descriptors(payload))
+    used = sum(len(part) for part in parts)
+    routing_anchors: dict[str, None] = {}
+
+    def add(piece: str) -> None:
+        nonlocal used
+        if not piece.strip() or used >= TOOL_NAVIGATION_CHARS:
+            return
+        available = TOOL_NAVIGATION_CHARS - used
+        parts.append(piece[:available])
+        used += min(len(piece), available)
+
+    def visit(item: Any, key: str = "", depth: int = 0) -> None:
+        # Continue scanning after the text preview is full so exact structured
+        # anchors from later fields still receive direct-index postings.
+        if depth > 16:
+            return
+        if isinstance(item, str):
+            if item.startswith("data:") or is_opaque_attachment_key(key):
+                return
+            safe = _navigation_safe_text(item)
+            for match in LEXICAL_TOKEN_RE.finditer(safe):
+                token = match.group(0)
+                if (
+                    len(routing_anchors) < 20_000
+                    and len(token) >= 6
+                    and any(char.isdigit() or char in "/_.:@+-" for char in token)
+                ):
+                    routing_anchors[token] = None
+            label = f"{key}: " if key and key not in {"text", "content", "output_text", "input_text"} else ""
+            if len(safe) <= TOOL_CHUNK_CHARS:
+                add(label + safe)
+                return
+            digest = hashlib.sha256(safe.encode("utf-8")).hexdigest()
+            anchors: dict[str, None] = {}
+            for match in LEXICAL_TOKEN_RE.finditer(safe):
+                token = match.group(0)
+                if token not in anchors and len(anchors) < 1_200:
+                    anchors[token] = None
+            add(
+                f"{label}[long visible tool field chars={len(safe)} sha256={digest}]\n"
+                f"{safe[:TOOL_LONG_FIELD_EDGE_CHARS]}\n[...raw middle indexed as lexical anchors...]\n"
+                f"{safe[-TOOL_LONG_FIELD_EDGE_CHARS:]}\nlexical anchors: {' '.join(anchors)}"
+            )
+            return
+        if isinstance(item, list):
+            for child in item:
+                visit(child, key, depth + 1)
+            return
+        if isinstance(item, dict):
+            for child_key, child in item.items():
+                if child_key in TOOL_SKIP_KEYS or is_opaque_attachment_key(child_key):
+                    continue
+                visit(child, child_key, depth + 1)
+
+    visit(payload)
+    return (
+        "\n".join(part for part in parts if part.strip())[:TOOL_NAVIGATION_CHARS],
+        tuple(routing_anchors),
+    )
+
+
+def iter_tool_evidence(path: Path, session_id: str) -> Iterator[ToolEvidence]:
+    """Index visible tool calls/results independently from bounded exchange summaries."""
+
+    with path.open("rb") as handle:
+        for line in iter_bounded_lines(handle):
+            if line.raw is None:
+                preview = (line.prefix + line.suffix).decode("utf-8", errors="ignore")
+                if not any(token in preview for token in ("tool", "function_call", "shell", "custom_tool", "apply_patch")):
+                    continue
+                text = (
+                    f"[oversized visible tool event raw_line={line.number} bytes={line.raw_bytes} "
+                    f"raw_sha256={line.raw_sha256}; exact bytes remain in raw archive]\n"
+                    f"lexical anchors: {line.lexical_sketch}"
+                )[:MAX_EVENT_TEXT_CHARS]
+                if text.strip():
+                    yield ToolEvidence(
+                        str(path.resolve()), session_id, "", line.number, 0, "oversized_tool", "", text,
+                        line.raw_sha256,
+                    )
+                continue
+            try:
+                row = json.loads(line.raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            payload, tool_kind, tool_name = _visible_tool_payload(row)
+            if payload is None:
+                continue
+            timestamp = str(row.get("timestamp") or "")
+            prefix = f"[visible tool evidence kind={tool_kind} name={tool_name or 'unnamed'} raw_line={line.number} raw_sha256={line.raw_sha256}]"
+            navigation, routing_anchors = _tool_navigation_text(payload)
+            if navigation.strip():
+                yield ToolEvidence(
+                    str(path.resolve()), session_id, timestamp, line.number, 0, tool_kind, tool_name,
+                    prefix + "\n" + navigation, line.raw_sha256, routing_anchors,
+                )
 
 
 def evidence_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
@@ -334,9 +536,9 @@ def evidence_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
     role, text = _message_role_and_text(row)
     if role:
         return role.replace("-fallback", ""), text
-    tool_text = _tool_text(row)
-    if tool_text:
-        return "tool", tool_text
+    payload, _tool_kind, _tool_name = _visible_tool_payload(row)
+    if payload is not None:
+        return "tool", "\n".join(_tool_string_chunks(payload))
     if row.get("type") == "compacted" or (
         row.get("type") == "event_msg"
         and isinstance(row.get("payload"), dict)

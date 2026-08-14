@@ -129,7 +129,7 @@ class RecallTests(unittest.TestCase):
 
     def test_status_exposes_new_index_capabilities_without_transcript_text(self) -> None:
         status = index_status(self.index_db)
-        self.assertEqual(status["schema_version"], 12)
+        self.assertEqual(status["schema_version"], 13)
         self.assertGreaterEqual(status["facets"], status["exchanges"])
         self.assertGreater(status["anchors"], 0)
         self.assertGreater(status["graph_edges"], 0)
@@ -137,7 +137,8 @@ class RecallTests(unittest.TestCase):
         self.assertGreaterEqual(status["reclaimable_bytes"], 0)
         self.assertIn("late-interaction", status["retrieval_backend"])
         self.assertEqual(status["evidence_views"], ["raw", "text", "media"])
-        self.assertIn("metadata-context-only", status["attachment_indexing"])
+        self.assertIn("metadata/context only", status["attachment_indexing"])
+        self.assertIn("hidden reasoning excluded", status["tool_evidence_indexing"])
         self.assertNotIn("atlas-catalog-v7", json.dumps(status))
 
     def test_exact_anchor_bypasses_semantic_uncertainty(self) -> None:
@@ -328,7 +329,7 @@ class RecallTests(unittest.TestCase):
         db.commit()
         db.close()
         report = sync_index(self.archives, stale)
-        self.assertEqual(report["schema_version"], 12)
+        self.assertEqual(report["schema_version"], 13)
         self.assertGreater(report["nodes"]["exchange"], 0)
 
     def test_own_local_vector_route_is_used(self) -> None:
@@ -626,6 +627,117 @@ class RecallTests(unittest.TestCase):
             self.index_db, str(archive.resolve()), 2, 2, 0, 250_000, "raw",
         )
         self.assertIn("A" * 2_048, raw_view["raw_jsonl"])
+
+    def test_all_file_families_receive_searchable_typed_descriptors(self) -> None:
+        archive = self.archives / "2038" / "rollout-artifacts-45454545-4545-4454-8454-454545454545.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "artifact-session"}},
+            {"timestamp": "2038-01-18T00:00:00Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": (
+                        "检查 /demo/fictional/archive-v9.tar.zst、/demo/fictional/train-0007.parquet、"
+                        "/demo/fictional/model-final.safetensors 和 /demo/fictional/cache.sqlite。"
+                    )},
+                    {"type": "input_file", "file_path": "/demo/fictional/opaque-bundle.customblob",
+                     "mime_type": "application/x-fictitious"},
+                ],
+            }},
+            message("assistant", "四类产物均已登记，批次 artifact-batch-909。", "2038-01-18T00:00:00Z"),
+        ]
+        archive.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+        sync_index(self.archives, self.index_db)
+        result = search_index(self.index_db, "model-final.safetensors artifact-batch-909", mode="auto")
+        self.assertTrue(result["safe_to_answer"])
+        self.assertEqual(result["results"][0]["session_id"], "artifact-session")
+        db = sqlite3.connect(self.index_db)
+        stored = db.execute("select user_message from exchanges where session_id='artifact-session'").fetchone()[0]
+        db.close()
+        self.assertIn("kind=archive 压缩包", stored)
+        self.assertIn("kind=data 数据文件", stored)
+        self.assertIn("kind=model 模型权重", stored)
+        self.assertIn("kind=database 数据库", stored)
+        self.assertIn("name=opaque-bundle.customblob", stored)
+
+    def test_long_tool_command_code_and_result_are_independently_indexed(self) -> None:
+        archive = self.archives / "2038" / "rollout-tools-46464646-4646-4464-8464-464646464646.jsonl"
+        middle_marker = "nebula-cli run mdl --queue=synthetic-queue --config=/demo/fictional/train.yaml"
+        long_output = ("boring-prefix-line\n" * 8_000) + middle_marker + "\n" + ("boring-suffix-line\n" * 8_000)
+        patch_text = "*** Begin Patch\n*** Update File: /demo/fictional/model.py\n+TOOL_PATCH_SENTINEL_424242 = True\n*** End Patch"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "tool-session"}},
+            message("user", "执行并核对超长训练工具输出。", "2038-01-19T00:00:00Z"),
+            {"timestamp": "2038-01-19T00:00:01Z", "type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command", "arguments": {"cmd": middle_marker},
+            }},
+            {"timestamp": "2038-01-19T00:00:02Z", "type": "response_item", "payload": {
+                "type": "function_call_output", "output": long_output,
+            }},
+            {"timestamp": "2038-01-19T00:00:03Z", "type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "apply_patch", "input": patch_text,
+            }},
+            message("assistant", "工具执行结束，结果编号 tool-result-5151。", "2038-01-19T00:00:04Z"),
+        ]
+        archive.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+        sync_index(self.archives, self.index_db)
+        for query in ("synthetic-queue train.yaml", "TOOL_PATCH_SENTINEL_424242"):
+            recalled = search_index(self.index_db, query, mode="auto", limit=5)
+            self.assertTrue(recalled["safe_to_answer"], query)
+            self.assertEqual(recalled["results"][0]["session_id"], "tool-session")
+            self.assertIn("visible tool evidence", recalled["results"][0]["snippet"])
+        db = sqlite3.connect(self.index_db)
+        tool_nodes = db.execute(
+            "select count(*) from nodes where id like 'exchange:tool:%' and session_id='tool-session'"
+        ).fetchone()[0]
+        indexed = "\n".join(row[0] for row in db.execute(
+            "select text from nodes where id like 'exchange:tool:%' and session_id='tool-session'"
+        ))
+        db.close()
+        self.assertGreaterEqual(tool_nodes, 3)
+        self.assertIn(middle_marker, indexed)
+        self.assertIn("TOOL_PATCH_SENTINEL_424242", indexed)
+        offset = 0
+        verified_pages: list[str] = []
+        for _ in range(8):
+            page = read_evidence(self.index_db, str(archive.resolve()), 4, 4, offset, 60_000, "text")
+            verified_pages.append(page["evidence_text"])
+            if page["complete"]:
+                break
+            offset = page["next_offset_chars"]
+        self.assertIn(middle_marker, "".join(verified_pages))
+
+    def test_missing_tool_command_still_abstains(self) -> None:
+        result = search_index(self.index_db, "nonexistent-tool-command-zz9911 --ghost-flag", mode="deep")
+        self.assertFalse(result["safe_to_answer"])
+
+    def test_oversized_tool_event_indexes_middle_anchors_without_copying_raw_body(self) -> None:
+        archive = self.archives / "2038" / "rollout-giant-tool-47474747-4747-4474-8474-474747474747.jsonl"
+        marker = "/demo/fictional/checkpoints/step_00123456.pt"
+        giant = ("ordinary-log-record\n" * 230_000) + marker + "\n" + ("ordinary-log-record\n" * 230_000)
+        rows = [
+            {"type": "session_meta", "payload": {"id": "giant-tool-session"}},
+            message("user", "定位超大工具日志中的断点。", "2038-01-20T00:00:00Z"),
+            {"timestamp": "2038-01-20T00:00:01Z", "type": "response_item", "payload": {
+                "type": "function_call_output", "output": giant,
+            }},
+            message("assistant", "定位完成。", "2038-01-20T00:00:02Z"),
+        ]
+        archive.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+        self.assertGreater(archive.stat().st_size, 8 * 1024 * 1024)
+        sync_index(self.archives, self.index_db)
+        result = search_index(self.index_db, marker, mode="auto", limit=3)
+        self.assertTrue(result["safe_to_answer"])
+        self.assertEqual(result["results"][0]["session_id"], "giant-tool-session")
+        self.assertIn("oversized visible tool event", result["results"][0]["snippet"])
+        db = sqlite3.connect(self.index_db)
+        indexed = db.execute(
+            "select text from nodes where id like 'exchange:tool:%' and session_id='giant-tool-session'"
+        ).fetchone()[0]
+        db.close()
+        self.assertIn(marker, indexed)
+        self.assertNotIn("ordinary-log-record\n" * 1_000, indexed)
+        raw = read_evidence(self.index_db, str(archive.resolve()), 3, 3, 0, 30_000, "raw")
+        self.assertFalse(raw["complete"])
+        self.assertEqual(raw["returned_chars"], 30_000)
 
     def test_duplicate_pdf_filename_uses_context_for_reranking(self) -> None:
         filename = "shared-synthetic-report.pdf"
