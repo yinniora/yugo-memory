@@ -27,6 +27,10 @@ function createStateDb(file, rows) {
   assert.equal(result.status, 0, result.stderr);
 }
 
+function canonicalArchive(memoryRoot, sessionId) {
+  return path.join(memoryRoot, 'archives', 'by-session', sessionId.slice(0, 2), `${sessionId}.jsonl`);
+}
+
 test('stores only compacted sessions and applies lifecycle deletion policy', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-'));
   const codexHome = path.join(root, 'codex');
@@ -59,9 +63,9 @@ test('stores only compacted sessions and applies lifecycle deletion policy', () 
   ]);
   fs.mkdirSync(memoryRoot, { recursive: true });
   fs.writeFileSync(path.join(memoryRoot, 'state.json'), JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 4,
     missingSince: {
-      [deletedRel]: Date.now() - 8 * 24 * 60 * 60 * 1000,
+      [deletedId]: Date.now() - 8 * 24 * 60 * 60 * 1000,
     },
     sourceStatus: {},
     legacyMigrations: {},
@@ -79,7 +83,9 @@ test('stores only compacted sessions and applies lifecycle deletion policy', () 
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /codex_thread_archived/);
-  assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', longRel)), true);
+  const longArchive = canonicalArchive(memoryRoot, longId);
+  assert.equal(fs.existsSync(longArchive), true);
+  assert.equal(fs.statSync(longArchive).ino, fs.statSync(path.join(codexHome, 'sessions', longRel)).ino);
   assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', shortRel)), false);
   assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', archivedRel)), false);
   assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', deletedRel)), false);
@@ -105,7 +111,8 @@ test('imports compacted archives from prior local memory roots without an upstre
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-migration-'));
   const configBase = path.join(root, 'config');
   const memoryRoot = path.join(root, 'yugo');
-  const relative = path.join('2038', '01', 'fictional-migration.jsonl');
+  const sessionId = '55555555-5555-4555-8555-555555555555';
+  const relative = path.join('2038', '01', `fictional-migration-${sessionId}.jsonl`);
   const legacy = path.join(configBase, 'codex-long-memory', 'archives', relative);
   writeJsonl(legacy, [
     { type: 'response_item', payload: { role: 'user', content: 'fictional migration detail' } },
@@ -124,6 +131,98 @@ test('imports compacted archives from prior local memory roots without an upstre
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', relative)), true);
+  assert.equal(fs.existsSync(canonicalArchive(memoryRoot, sessionId)), true);
+  assert.equal(
+    fs.readdirSync(path.join(memoryRoot, 'archives', 'by-session', sessionId.slice(0, 2))).length,
+    1,
+  );
   assert.match(result.stdout, /"legacyMigrations": 1/);
+});
+
+test('collapses growing legacy snapshots to one canonical session and relinks the live source', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-canonical-'));
+  const codexHome = path.join(root, 'codex');
+  const memoryRoot = path.join(root, 'memory');
+  const sessionId = '66666666-6666-4666-8666-666666666666';
+  const source = path.join(
+    codexHome, 'sessions', '2038', '02', `rollout-live-${sessionId}.jsonl`,
+  );
+  const rows = [
+    { type: 'response_item', payload: { role: 'user', content: 'fictional canonical detail' } },
+    { type: 'compacted', payload: { replacement: 'routing summary' } },
+    { type: 'response_item', payload: { role: 'assistant', content: 'latest source tail' } },
+  ];
+  writeJsonl(source, rows);
+  writeJsonl(
+    path.join(memoryRoot, 'archives', 'legacy-a', `snapshot-${sessionId}.jsonl`),
+    rows.slice(0, 2),
+  );
+  writeJsonl(
+    path.join(memoryRoot, 'archives', 'legacy-b', `snapshot-${sessionId}.jsonl`),
+    rows,
+  );
+  createStateDb(path.join(codexHome, 'state_5.sqlite'), [[sessionId, 0]]);
+
+  const result = spawnSync(process.execPath, [memoryScript], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      YUGO_MEMORY_HOME: memoryRoot,
+      YUGO_MEMORY_SKIP_INDEX: '1',
+      YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const canonical = canonicalArchive(memoryRoot, sessionId);
+  assert.equal(fs.statSync(canonical).ino, fs.statSync(source).ino);
+  assert.equal(
+    fs.readdirSync(path.join(memoryRoot, 'archives', 'by-session', sessionId.slice(0, 2))).length,
+    1,
+  );
+  assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', 'legacy-a')), false);
+  assert.equal(fs.existsSync(path.join(memoryRoot, 'archives', 'legacy-b')), false);
+  assert.match(result.stdout, /"duplicatesRemoved": 2/);
+  assert.match(result.stdout, /"hardlinked": 1/);
+});
+
+test('canonical hard link preserves the seven-day deletion grace without duplicate live blocks', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-grace-'));
+  const codexHome = path.join(root, 'codex');
+  const memoryRoot = path.join(root, 'memory');
+  const sessionId = '77777777-7777-4777-8777-777777777777';
+  const source = path.join(
+    codexHome, 'sessions', '2038', '03', `rollout-grace-${sessionId}.jsonl`,
+  );
+  writeJsonl(source, [
+    { type: 'response_item', payload: { role: 'user', content: 'fictional grace detail' } },
+    { type: 'compacted', payload: { replacement: 'routing summary' } },
+  ]);
+  const stateDb = path.join(codexHome, 'state_5.sqlite');
+  createStateDb(stateDb, [[sessionId, 0]]);
+  const env = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    YUGO_MEMORY_HOME: memoryRoot,
+    YUGO_MEMORY_SKIP_INDEX: '1',
+    YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+  };
+  let result = spawnSync(process.execPath, [memoryScript], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stderr);
+  const canonical = canonicalArchive(memoryRoot, sessionId);
+  assert.equal(fs.statSync(canonical).ino, fs.statSync(source).ino);
+
+  fs.unlinkSync(source);
+  fs.unlinkSync(stateDb);
+  createStateDb(stateDb, []);
+  fs.writeFileSync(path.join(memoryRoot, 'state.json'), JSON.stringify({
+    schemaVersion: 4,
+    missingSince: { [sessionId]: Date.now() - 8 * 24 * 60 * 60 * 1000 },
+    sourceStatus: {},
+    legacyMigrations: {},
+  }));
+  result = spawnSync(process.execPath, [memoryScript], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /"expiredDeletes"/);
+  assert.equal(fs.existsSync(canonical), false);
 });

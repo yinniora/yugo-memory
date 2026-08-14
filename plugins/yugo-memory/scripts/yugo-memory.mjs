@@ -74,9 +74,24 @@ function archivedSessionMap(root) {
   const result = new Map();
   for (const file of walkJsonl(root)) {
     const sessionId = sessionIdFromFile(file);
-    if (sessionId) result.set(sessionId, file);
+    if (!sessionId) continue;
+    const previous = result.get(sessionId);
+    if (!previous) {
+      result.set(sessionId, file);
+      continue;
+    }
+    const candidateStat = fs.statSync(file);
+    const previousStat = fs.statSync(previous);
+    if (
+      candidateStat.size > previousStat.size
+      || (candidateStat.size === previousStat.size && candidateStat.mtimeMs > previousStat.mtimeMs)
+    ) result.set(sessionId, file);
   }
   return result;
+}
+
+function canonicalArchivePath(sessionId) {
+  return path.join(archiveRoot, 'by-session', sessionId.slice(0, 2), `${sessionId}.jsonl`);
 }
 
 function parseThreadRows(text) {
@@ -128,19 +143,24 @@ function crossedCompactionBoundary(file) {
 
 function loadState() {
   if (!fs.existsSync(statePath)) {
-    return { schemaVersion: 3, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
+    return { schemaVersion: 4, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
   }
   try {
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    const compatible = Number(state?.schemaVersion || 0) >= 4;
     return {
-      schemaVersion: 3,
-      missingSince: state?.missingSince && typeof state.missingSince === 'object' ? state.missingSince : {},
-      sourceStatus: state?.sourceStatus && typeof state.sourceStatus === 'object' ? state.sourceStatus : {},
+      schemaVersion: 4,
+      // v3 keyed these maps by relative paths. Resetting only delays final
+      // deletion; it can never remove evidence before the configured grace.
+      missingSince: compatible && state?.missingSince && typeof state.missingSince === 'object'
+        ? state.missingSince : {},
+      sourceStatus: compatible && state?.sourceStatus && typeof state.sourceStatus === 'object'
+        ? state.sourceStatus : {},
       legacyMigrations: state?.legacyMigrations && typeof state.legacyMigrations === 'object'
         ? state.legacyMigrations : {},
     };
   } catch {
-    return { schemaVersion: 3, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
+    return { schemaVersion: 4, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
   }
 }
 
@@ -199,14 +219,83 @@ function copyOrLink(source, destination) {
   return true;
 }
 
-function refreshArchives(longSources) {
-  if (dryRun) return 0;
-  ensurePrivateDir(archiveRoot);
-  let changed = 0;
-  for (const [relative, source] of longSources) {
-    if (copyOrLink(source, path.join(archiveRoot, relative))) changed += 1;
+function replaceWithSourceLink(source, destination) {
+  ensurePrivateDir(path.dirname(destination));
+  if (fs.existsSync(destination)) {
+    const sourceStat = fs.statSync(source);
+    const destinationStat = fs.statSync(destination);
+    if (sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino) {
+      return { changed: false, mode: 'hardlink' };
+    }
   }
-  return changed;
+  const temp = `${destination}.tmp.${process.pid}`;
+  try {
+    fs.unlinkSync(temp);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  let mode = 'hardlink';
+  try {
+    fs.linkSync(source, temp);
+  } catch (error) {
+    if (!['EXDEV', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+    mode = 'copy';
+    fs.copyFileSync(source, temp);
+    fs.chmodSync(temp, 0o600);
+  }
+  fs.renameSync(temp, destination);
+  return { changed: true, mode };
+}
+
+function canonicalizeArchives() {
+  const groups = new Map();
+  for (const file of walkJsonl(archiveRoot)) {
+    const sessionId = sessionIdFromFile(file);
+    if (!sessionId) continue;
+    if (!groups.has(sessionId)) groups.set(sessionId, []);
+    groups.get(sessionId).push(file);
+  }
+  let canonicalized = 0;
+  let duplicatesRemoved = 0;
+  for (const [sessionId, files] of groups) {
+    const canonical = canonicalArchivePath(sessionId);
+    const best = [...files].sort((left, right) => {
+      const leftStat = fs.statSync(left);
+      const rightStat = fs.statSync(right);
+      return rightStat.size - leftStat.size || rightStat.mtimeMs - leftStat.mtimeMs;
+    })[0];
+    if (dryRun) {
+      if (path.resolve(best) !== path.resolve(canonical)) canonicalized += 1;
+      duplicatesRemoved += files.length - 1;
+      continue;
+    }
+    if (path.resolve(best) !== path.resolve(canonical)) {
+      copyOrLink(best, canonical);
+      canonicalized += 1;
+    }
+    for (const file of files) {
+      if (path.resolve(file) === path.resolve(canonical)) continue;
+      removeFile(file, []);
+      pruneEmptyParents(file, archiveRoot);
+      duplicatesRemoved += 1;
+    }
+  }
+  return { canonicalized, duplicatesRemoved };
+}
+
+function refreshArchives(longSources) {
+  if (dryRun) return { refreshed: longSources.size, hardlinked: 0, copied: 0 };
+  ensurePrivateDir(archiveRoot);
+  let refreshed = 0;
+  let hardlinked = 0;
+  let copied = 0;
+  for (const [sessionId, source] of longSources) {
+    const result = replaceWithSourceLink(source, canonicalArchivePath(sessionId));
+    if (result.changed) refreshed += 1;
+    if (result.mode === 'hardlink') hardlinked += 1;
+    else copied += 1;
+  }
+  return { refreshed, hardlinked, copied };
 }
 
 async function migrateLegacyArchives(state) {
@@ -293,65 +382,68 @@ function doctorReport() {
 }
 
 async function main() {
-  const activeSources = relativeMap(sourceRoot);
+  const activeSources = archivedSessionMap(sourceRoot);
   const archivedSources = archivedSessionMap(archivedSourceRoot);
   const threadStates = loadThreadStates();
   const sources = new Map();
-  for (const [relative, file] of activeSources) {
-    const sessionId = sessionIdFromFile(file);
+  for (const [sessionId, file] of activeSources) {
     const threadState = sessionId ? threadStates?.get(sessionId) : null;
-    if (!threadStates || !sessionId || (threadState && !threadState.archived)) sources.set(relative, file);
+    if (!threadStates || (threadState && !threadState.archived)) sources.set(sessionId, file);
   }
 
   const state = loadState();
   const legacyMigrations = await migrateLegacyArchives(state);
+  const canonicalization = canonicalizeArchives();
   const longSources = new Map();
-  for (const [relative, file] of sources) {
+  for (const [sessionId, file] of sources) {
     const stat = fs.statSync(file);
-    const cached = state.sourceStatus[relative];
+    const cached = state.sourceStatus[sessionId];
     let isLong;
     if (cached?.long === true) isLong = true;
     else if (cached?.size === stat.size && cached?.mtimeMs === stat.mtimeMs) isLong = false;
     else isLong = await crossedCompactionBoundary(file);
-    state.sourceStatus[relative] = { size: stat.size, mtimeMs: stat.mtimeMs, long: isLong };
-    if (isLong) longSources.set(relative, file);
+    state.sourceStatus[sessionId] = {
+      path: file, size: stat.size, mtimeMs: stat.mtimeMs, long: isLong,
+    };
+    if (isLong) longSources.set(sessionId, file);
   }
-  for (const relative of Object.keys(state.sourceStatus)) {
-    if (!sources.has(relative)) delete state.sourceStatus[relative];
+  for (const sessionId of Object.keys(state.sourceStatus)) {
+    if (!sources.has(sessionId)) delete state.sourceStatus[sessionId];
   }
 
   const immediateDeletes = [];
   const expiredDeletes = [];
   const pendingDeletes = [];
-  for (const [relative, archive] of relativeMap(archiveRoot)) {
-    const sessionId = sessionIdFromFile(archive);
+  for (const [sessionId, archive] of archivedSessionMap(archiveRoot)) {
     const threadState = sessionId ? threadStates?.get(sessionId) : null;
     const archivedByFallback = !threadStates && sessionId && archivedSources.has(sessionId);
     if (threadState?.archived || archivedByFallback) {
-      immediateDeletes.push({ relative, archive, reason: 'codex_thread_archived' });
-      delete state.missingSince[relative];
+      immediateDeletes.push({ sessionId, archive, reason: 'codex_thread_archived' });
+      delete state.missingSince[sessionId];
       continue;
     }
-    const source = sources.get(relative);
-    if (source && !longSources.has(relative)) {
-      immediateDeletes.push({ relative, archive, reason: 'below_compaction_boundary' });
-      delete state.missingSince[relative];
+    const source = sources.get(sessionId);
+    if (source && !longSources.has(sessionId)) {
+      immediateDeletes.push({ sessionId, archive, reason: 'below_compaction_boundary' });
+      delete state.missingSince[sessionId];
       continue;
     }
     if (source || (threadStates && threadState && !threadState.archived)) {
-      delete state.missingSince[relative];
+      delete state.missingSince[sessionId];
       continue;
     }
     if (!(await crossedCompactionBoundary(archive))) {
-      immediateDeletes.push({ relative, archive, reason: 'legacy_short_archive' });
-      delete state.missingSince[relative];
+      immediateDeletes.push({ sessionId, archive, reason: 'legacy_short_archive' });
+      delete state.missingSince[sessionId];
       continue;
     }
-    const missingSince = Number(state.missingSince[relative] || now);
-    state.missingSince[relative] = missingSince;
-    if (now - missingSince >= deletedRetentionMs) expiredDeletes.push({ relative, archive, missingSince });
+    const missingSince = Number(state.missingSince[sessionId] || now);
+    state.missingSince[sessionId] = missingSince;
+    if (now - missingSince >= deletedRetentionMs) {
+      expiredDeletes.push({ sessionId, archive, missingSince });
+    }
     else pendingDeletes.push({
-      relative,
+      sessionId,
       missingSince: new Date(missingSince).toISOString(),
       deleteAfter: new Date(missingSince + deletedRetentionMs).toISOString(),
     });
@@ -366,11 +458,12 @@ async function main() {
     codexStateDatabaseAvailable: threadStates !== null,
     compactedLongSessions: longSources.size,
     belowBoundarySessions: sources.size - longSources.size,
-    existingArchives: relativeMap(archiveRoot).size,
+    existingArchives: archivedSessionMap(archiveRoot).size,
     legacyMigrations,
-    immediateDeletes: immediateDeletes.map(({ relative, reason }) => ({ relative, reason })),
-    expiredDeletes: expiredDeletes.map(({ relative, missingSince }) => ({
-      relative, missingSince: new Date(missingSince).toISOString(),
+    canonicalization,
+    immediateDeletes: immediateDeletes.map(({ sessionId, reason }) => ({ sessionId, reason })),
+    expiredDeletes: expiredDeletes.map(({ sessionId, missingSince }) => ({
+      sessionId, missingSince: new Date(missingSince).toISOString(),
     })),
     pendingDeletes,
   });
@@ -379,15 +472,15 @@ async function main() {
   for (const item of [...immediateDeletes, ...expiredDeletes]) {
     removeFile(item.archive, removed);
     pruneEmptyParents(item.archive, archiveRoot);
-    delete state.missingSince[item.relative];
+    delete state.missingSince[item.sessionId];
   }
-  const refreshedArchives = refreshArchives(longSources);
+  const archiveRefresh = refreshArchives(longSources);
   const indexReport = runIndex();
   if (!dryRun) saveState(state);
   output({
     completed: true,
     archivedLongSessions: longSources.size,
-    refreshedArchives,
+    archiveRefresh,
     [dryRun ? 'plannedMemoryFileDeletes' : 'permanentlyDeletedMemoryFiles']: removed.length,
     pendingDeletedSessions: pendingDeletes.length,
     indexReport,
