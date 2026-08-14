@@ -39,7 +39,7 @@ from retrieval_layers import (
 )
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 EPISODE_EXCHANGES = 10
 EPISODE_OVERLAP = 2
 EXCHANGE_CHARS = 12_000
@@ -94,8 +94,11 @@ def default_paths() -> tuple[Path, Path]:
 
 def connect_index(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    new_database = not path.exists()
     connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
+    if new_database:
+        connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA foreign_keys=ON")
@@ -113,7 +116,7 @@ def create_schema(db: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS indexed_files (
           archive_path TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
@@ -125,7 +128,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           parser_state TEXT NOT NULL,
           exchange_count INTEGER NOT NULL,
           indexed_at TEXT NOT NULL
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS archive_seek_points (
           archive_path TEXT NOT NULL,
           line_number INTEGER NOT NULL,
@@ -133,7 +136,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           prefix_sha256 TEXT NOT NULL,
           prefix_length INTEGER NOT NULL,
           PRIMARY KEY(archive_path, line_number)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_seek_archive_line
           ON archive_seek_points(archive_path, line_number);
         CREATE TABLE IF NOT EXISTS compactions (
@@ -141,7 +144,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           line_number INTEGER NOT NULL,
           summary_text TEXT NOT NULL,
           PRIMARY KEY(archive_path, line_number)
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS exchanges (
           id TEXT PRIMARY KEY,
           archive_path TEXT NOT NULL,
@@ -155,7 +158,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           cwd TEXT,
           git_branch TEXT,
           turn_kind TEXT NOT NULL CHECK(turn_kind IN ('user', 'delegation'))
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_exchanges_archive_line
           ON exchanges(archive_path, line_start, line_end);
         CREATE INDEX IF NOT EXISTS idx_exchanges_session_line
@@ -176,7 +179,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           terms TEXT NOT NULL,
           embedding BLOB NOT NULL,
           content_hash TEXT NOT NULL
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_nodes_level ON nodes(level);
         CREATE INDEX IF NOT EXISTS idx_nodes_session ON nodes(session_id, line_start, line_end);
         CREATE INDEX IF NOT EXISTS idx_nodes_archive ON nodes(archive_path, line_start, line_end);
@@ -189,21 +192,21 @@ def create_schema(db: sqlite3.Connection) -> None:
           embedding BLOB NOT NULL,
           simhash INTEGER NOT NULL,
           PRIMARY KEY(node_id, facet_ordinal)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_facets_node ON node_facets(node_id);
         CREATE TABLE IF NOT EXISTS node_lsh (
           band TEXT NOT NULL,
           node_id TEXT NOT NULL,
           facet_ordinal INTEGER NOT NULL,
           PRIMARY KEY(band, node_id, facet_ordinal)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_lsh_band ON node_lsh(band);
         CREATE TABLE IF NOT EXISTS node_anchors (
           anchor TEXT NOT NULL,
           node_id TEXT NOT NULL,
           decisive INTEGER NOT NULL,
           PRIMARY KEY(anchor, node_id)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_anchors_node ON node_anchors(node_id);
         CREATE TABLE IF NOT EXISTS node_edges (
           source_id TEXT NOT NULL,
@@ -211,7 +214,7 @@ def create_schema(db: sqlite3.Connection) -> None:
           relation TEXT NOT NULL,
           weight REAL NOT NULL,
           PRIMARY KEY(source_id, target_id, relation)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_edges_source ON node_edges(source_id);
         CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
           node_id UNINDEXED,
@@ -648,11 +651,17 @@ def sync_index(archive_root: Path, index_path: Path, force: bool = False) -> dic
         db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('last_indexed_at', datetime('now'))")
         db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES('runtime_dependency', 'none')")
 
+    if removed:
+        db.execute("PRAGMA incremental_vacuum")
+    db.execute("PRAGMA optimize")
     counts = {
         row["level"]: row["count"]
         for row in db.execute("SELECT level, count(*) AS count FROM nodes GROUP BY level")
     }
     exchange_count = db.execute("SELECT count(*) FROM exchanges").fetchone()[0]
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
+    page_count = db.execute("PRAGMA page_count").fetchone()[0]
+    freelist_count = db.execute("PRAGMA freelist_count").fetchone()[0]
     db.close()
     return {
         "schema_version": SCHEMA_VERSION,
@@ -664,6 +673,8 @@ def sync_index(archive_root: Path, index_path: Path, force: bool = False) -> dic
         "exchanges": exchange_count,
         "nodes": counts,
         "graph_edges": edge_count,
+        "index_bytes": page_size * page_count,
+        "reclaimable_bytes": page_size * freelist_count,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         "archive_root": str(archive_root),
         "index_path": str(index_path),
@@ -1514,6 +1525,9 @@ def index_status(index_path: Path) -> dict[str, Any]:
     facets = db.execute("SELECT count(*) FROM node_facets").fetchone()[0]
     anchors = db.execute("SELECT count(*) FROM node_anchors").fetchone()[0]
     edges = db.execute("SELECT count(*) FROM node_edges").fetchone()[0]
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
+    page_count = db.execute("PRAGMA page_count").fetchone()[0]
+    freelist_count = db.execute("PRAGMA freelist_count").fetchone()[0]
     db.close()
     return {
         "ready": True,
@@ -1524,6 +1538,8 @@ def index_status(index_path: Path) -> dict[str, Any]:
         "facets": facets,
         "anchors": anchors,
         "graph_edges": edges,
+        "index_bytes": page_size * page_count,
+        "reclaimable_bytes": page_size * freelist_count,
         "schema_version": SCHEMA_VERSION,
         "retrieval_backend": "yugo-local-hybrid-late-interaction-lsh-graph-v1",
         "metadata": metadata,

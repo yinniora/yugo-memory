@@ -30,6 +30,12 @@ BROWSER_CONTEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 REQUEST_HEADING_RE = re.compile(r"^\s*##\s*My request for Codex:\s*", re.IGNORECASE)
+DATA_URL_RE = re.compile(
+    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]{2048,}",
+    re.IGNORECASE,
+)
+OPAQUE_TOKEN_RE = re.compile(r"(?<![a-z0-9+/])[a-z0-9+/]{2048,}={0,2}(?![a-z0-9+/])", re.IGNORECASE)
+OPAQUE_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{4096,}(?![0-9a-f])", re.IGNORECASE)
 
 
 @dataclass
@@ -91,8 +97,19 @@ class ParserState:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 
 
+def _navigation_safe_text(value: str) -> str:
+    """Remove opaque binary encodings while preserving an auditable marker."""
+
+    def marker(match: re.Match[str]) -> str:
+        return f"[opaque payload omitted from index: {len(match.group(0))} chars]"
+
+    value = DATA_URL_RE.sub(marker, value)
+    value = OPAQUE_TOKEN_RE.sub(marker, value)
+    return OPAQUE_HEX_RE.sub(marker, value)
+
+
 def _bounded_append(existing: str, addition: str, limit: int = MAX_PENDING_TEXT_CHARS) -> str:
-    addition = (addition or "").strip()
+    addition = _navigation_safe_text(addition or "").strip()
     if not addition or len(existing) >= limit:
         return existing
     separator = "\n" if existing else ""
@@ -113,7 +130,7 @@ def _text_fragments(value: Any, budget: int = MAX_EVENT_TEXT_CHARS) -> str:
             remaining = budget - used
             if remaining <= 0:
                 return
-            piece = item[:remaining]
+            piece = _navigation_safe_text(item[:remaining])
             if piece.strip():
                 parts.append(piece)
                 used += len(piece)

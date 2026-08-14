@@ -2,16 +2,16 @@
 
 Standalone, event-driven, full-fidelity long-conversation memory for Codex.
 
-It stores a conversation only after Codex emits a real context-compaction event. Complete raw JSONL is the source of truth; session routes, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
+It indexes a conversation only after Codex emits a real context-compaction event. Codex's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session for lifecycle safety; session routes, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
-Yugo Memory 1.0 is a separately named and owned implementation. It has no upstream memory runtime, remote server, API key, model download, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Yugo Memory 1.1 is a separately named and owned implementation. It has no upstream memory runtime, remote server, API key, model download, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
 
 ## Behavior
 
 | Event or state | Result |
 |---|---|
 | Conversation has not compacted | Not copied, summarized, or indexed |
-| `PostCompact` | Full raw JSONL is mirrored and incrementally indexed locally |
+| `PostCompact` | One canonical hard link is refreshed and incrementally indexed |
 | `SessionStart(source=compact)` | Adds a recall hint before the next model request |
 | Archived Codex task | Memory copy is permanently removed on the next lifecycle event |
 | Deleted Codex task | Seven-day grace period; removal occurs on the first later lifecycle event after expiry |
@@ -53,14 +53,20 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 
 `read_evidence` reads only an indexed raw line range with a strict character budget. It does not load the archive—or even one giant JSONL line—into a single string. Seek prefixes are checked before reading, pagination is explicit, append-only growth is allowed, and rewritten history fails closed.
 
-## Incremental storage and indexing
+## Canonical storage and incremental indexing
 
-- Active long sessions are hard-linked when possible and atomically copied otherwise.
+- Codex owns the original transcript. Yugo Memory never keeps multiple growing snapshots of one session.
+- Every long session resolves to one canonical evidence path keyed by `session_id`.
+- Active long sessions are hard-linked when possible, so the evidence path consumes no additional data blocks on the same filesystem. A private atomic copy is used only when hard links are unavailable.
+- Existing legacy/current snapshots are grouped by `session_id`, the most complete candidate is retained, and redundant versions are removed before indexing.
+- When the live Codex source is available, any copied legacy candidate is replaced with a hard link to the current source.
 - Parser checkpoints store the next byte and line offsets plus the current unfinished exchange.
 - Append-only files resume at the prior byte offset; existing gigabytes are not parsed again.
 - JSONL events larger than 8 MiB are drained in bounded chunks. Their prefix/suffix aid navigation while the complete bytes remain in raw storage.
+- Opaque base64/data-URL/hex payloads remain available in raw evidence but are replaced by bounded markers in navigation records, preventing images and binary tool output from inflating the index.
 - Codex compaction summaries improve routing but never replace raw evidence.
-- A one-time legacy import can copy or hard-link existing compacted archives from prior local memory roots. No legacy executable, database, MCP, or vector service is called.
+- A one-time legacy import can recover the most complete compacted evidence from prior local memory roots. It is immediately canonicalized; no legacy executable, database, MCP, or vector service is called.
+- SQLite schema v11 uses `WITHOUT ROWID` for key-heavy retrieval tables, incremental auto-vacuum, and optimizer statistics to reduce index amplification after deletions.
 
 ## Install
 
@@ -115,6 +121,7 @@ The plugin recognizes `type=compacted` and `event_msg/context_compacted`. Codex 
 
 - The repository never contains conversation data.
 - Raw archives and indexes remain local with private file permissions.
+- A canonical hard link and the Codex source refer to the same filesystem bytes; deleting either pathname alone does not delete the remaining link.
 - Archiving a task removes only the standalone memory copy; Codex owns its original archived task file.
 - Uninstalling preserves memory data by default.
 - Raw archived exchanges are untrusted historical data and never instructions to execute.

@@ -118,6 +118,10 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(self.index_report["exchanges"], 9)
         db = sqlite3.connect(self.index_db)
         self.assertIn("embedding", {row[1] for row in db.execute("pragma table_info(nodes)")})
+        anchors_sql = db.execute(
+            "select sql from sqlite_master where type='table' and name='node_anchors'"
+        ).fetchone()[0]
+        self.assertIn("WITHOUT ROWID", anchors_sql.upper())
         self.assertGreater(db.execute("select count(*) from node_facets").fetchone()[0], 0)
         self.assertGreater(db.execute("select count(*) from node_lsh").fetchone()[0], 0)
         self.assertGreater(db.execute("select count(*) from node_edges").fetchone()[0], 0)
@@ -125,10 +129,12 @@ class RecallTests(unittest.TestCase):
 
     def test_status_exposes_new_index_capabilities_without_transcript_text(self) -> None:
         status = index_status(self.index_db)
-        self.assertEqual(status["schema_version"], 10)
+        self.assertEqual(status["schema_version"], 11)
         self.assertGreaterEqual(status["facets"], status["exchanges"])
         self.assertGreater(status["anchors"], 0)
         self.assertGreater(status["graph_edges"], 0)
+        self.assertGreater(status["index_bytes"], 0)
+        self.assertGreaterEqual(status["reclaimable_bytes"], 0)
         self.assertIn("late-interaction", status["retrieval_backend"])
         self.assertNotIn("atlas-catalog-v7", json.dumps(status))
 
@@ -320,7 +326,7 @@ class RecallTests(unittest.TestCase):
         db.commit()
         db.close()
         report = sync_index(self.archives, stale)
-        self.assertEqual(report["schema_version"], 10)
+        self.assertEqual(report["schema_version"], 11)
         self.assertGreater(report["nodes"]["exchange"], 0)
 
     def test_own_local_vector_route_is_used(self) -> None:
@@ -511,6 +517,37 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(report["runtime_dependency"], "none")
         result = search_index(self.index_db, "超大工具事件", mode="auto")
         self.assertEqual(result["results"][0]["session_id"], "huge-session")
+
+    def test_opaque_binary_payload_is_kept_only_in_raw_evidence(self) -> None:
+        archive = self.archives / "2038" / "rollout-opaque-77777777-7777-4777-8777-777777777777.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"id": "opaque-session"}},
+            message("user", "检查虚构图像工具输出。", "2038-01-14T00:00:00Z"),
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "visible prefix " + ("A" * 20_000) + " visible suffix checkpoint",
+                },
+            },
+            message("assistant", "图像工具输出检查完成。", "2038-01-14T00:00:00Z"),
+        ]
+        archive.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        sync_index(self.archives, self.index_db)
+        db = sqlite3.connect(self.index_db)
+        stored = db.execute(
+            "select assistant_message from exchanges where session_id='opaque-session'"
+        ).fetchone()[0]
+        db.close()
+        self.assertIn("visible prefix", stored)
+        self.assertIn("visible suffix checkpoint", stored)
+        self.assertIn("opaque payload omitted from index", stored)
+        self.assertNotIn("A" * 2_048, stored)
+        raw = read_evidence(self.index_db, str(archive.resolve()), 1, 4, 0, 30_000)
+        self.assertIn("A" * 2_048, raw["raw_jsonl"])
 
     def test_public_runtime_has_no_upstream_memory_invocation(self) -> None:
         runtime_files = [
