@@ -1,11 +1,11 @@
 {
   "name": "yugo-memory-repository",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs && python3 -m unittest discover -s tests -p 'test_*.py'",
-    "validate": "node --check plugins/yugo-memory/scripts/yugo-memory.mjs && node --check plugins/yugo-memory/scripts/compact-recall-context.mjs && python3 -m py_compile plugins/yugo-memory/scripts/archive_parser.py plugins/yugo-memory/scripts/local_embedding.py plugins/yugo-memory/scripts/recall_common.py plugins/yugo-memory/scripts/retrieval_layers.py plugins/yugo-memory/scripts/recall_index.py plugins/yugo-memory/scripts/recall_mcp.py scripts/benchmark-private.py scripts/privacy-scan.py scripts/release-check.py",
+    "validate": "node --check plugins/yugo-memory/scripts/yugo-memory.mjs && node --check plugins/yugo-memory/scripts/compact-recall-context.mjs && python3 -m py_compile plugins/yugo-memory/scripts/attachment_adapter.py plugins/yugo-memory/scripts/archive_parser.py plugins/yugo-memory/scripts/local_embedding.py plugins/yugo-memory/scripts/recall_common.py plugins/yugo-memory/scripts/retrieval_layers.py plugins/yugo-memory/scripts/recall_index.py plugins/yugo-memory/scripts/recall_mcp.py scripts/benchmark-private.py scripts/privacy-scan.py scripts/release-check.py",
     "privacy": "python3 scripts/privacy-scan.py",
     "release-check": "python3 scripts/release-check.py"
   }

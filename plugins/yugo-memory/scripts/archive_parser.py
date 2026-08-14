@@ -15,6 +15,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
+from attachment_adapter import (
+    attachment_descriptors,
+    is_opaque_attachment_key,
+    oversized_attachment_descriptors,
+)
+
 
 READ_CHUNK_BYTES = 64 * 1024
 MAX_JSON_LINE_BYTES = 8 * 1024 * 1024
@@ -31,7 +37,7 @@ BROWSER_CONTEXT_RE = re.compile(
 )
 REQUEST_HEADING_RE = re.compile(r"^\s*##\s*My request for Codex:\s*", re.IGNORECASE)
 DATA_URL_RE = re.compile(
-    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]{2048,}",
+    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]{16,}",
     re.IGNORECASE,
 )
 OPAQUE_TOKEN_RE = re.compile(r"(?<![a-z0-9+/])[a-z0-9+/]{2048,}={0,2}(?![a-z0-9+/])", re.IGNORECASE)
@@ -48,6 +54,8 @@ class RawLine:
     suffix: bytes
     prefix_sha256: str
     prefix_length: int
+    raw_sha256: str
+    raw_bytes: int
     oversized: bool
 
 
@@ -119,8 +127,9 @@ def _bounded_append(existing: str, addition: str, limit: int = MAX_PENDING_TEXT_
 def _text_fragments(value: Any, budget: int = MAX_EVENT_TEXT_CHARS) -> str:
     """Extract human-visible strings from one already-bounded decoded event."""
 
-    parts: list[str] = []
-    used = 0
+    descriptors = attachment_descriptors(value)
+    parts: list[str] = list(descriptors)
+    used = sum(len(item) for item in descriptors)
 
     def visit(item: Any, depth: int = 0) -> None:
         nonlocal used
@@ -157,7 +166,7 @@ def _text_fragments(value: Any, budget: int = MAX_EVENT_TEXT_CHARS) -> str:
                     "images", "local_images", "audio", "local_audio",
                     "type", "role", "id", "status", "phase", "call_id",
                     "annotations", "metadata", "mime_type",
-                }:
+                } and not is_opaque_attachment_key(key):
                     visit(child, depth + 1)
                 if used >= budget:
                     break
@@ -172,9 +181,46 @@ def _jsonish_preview(line: RawLine) -> str:
     prefix = line.prefix.decode("utf-8", errors="replace")
     suffix = line.suffix.decode("utf-8", errors="replace")
     return (
-        f"[oversized JSONL event at raw line {line.number}; bounded navigation preview]\n"
+        f"[oversized JSONL event at raw line {line.number}; bytes={line.raw_bytes}; "
+        f"raw_sha256={line.raw_sha256}; bounded navigation preview]\n"
         f"{prefix}\n[...middle retained only in raw archive...]\n{suffix}"
     )[:MAX_EVENT_TEXT_CHARS]
+
+
+JSON_TEXT_FIELD_RE = re.compile(
+    r'"(?:text|input_text|output_text|message|path|file_path|name|filename)"\s*:\s*'
+    r'(?P<value>"(?:\\.|[^"\\]){0,48000}")',
+    re.DOTALL,
+)
+JSON_ROLE_RE = re.compile(r'"role"\s*:\s*"(?P<role>user|assistant)"')
+
+
+def oversized_evidence_text(line: RawLine) -> tuple[str, str]:
+    """Recover bounded text and media routing from a too-large JSONL event."""
+
+    prefix = line.prefix.decode("utf-8", errors="replace")
+    suffix = line.suffix.decode("utf-8", errors="replace")
+    combined = prefix + "\n" + suffix
+    role_match = JSON_ROLE_RE.search(prefix)
+    role = role_match.group("role") if role_match else "tool"
+    parts = oversized_attachment_descriptors(
+        line.prefix, line.suffix, line.raw_bytes, line.raw_sha256,
+    )
+    used = sum(len(item) for item in parts)
+    for match in JSON_TEXT_FIELD_RE.finditer(combined):
+        try:
+            value = json.loads(match.group("value"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str) and value.strip() and not value.startswith("data:"):
+            piece = _navigation_safe_text(value)
+            parts.append(piece)
+            used += len(piece)
+        if used >= MAX_EVENT_TEXT_CHARS:
+            break
+    if not parts:
+        parts.append(_jsonish_preview(line))
+    return role, "\n".join(parts)[:MAX_EVENT_TEXT_CHARS]
 
 
 def iter_bounded_lines(
@@ -206,6 +252,8 @@ def iter_bounded_lines(
                 suffix=first[-OVERSIZED_PREVIEW_BYTES:],
                 prefix_sha256=hashlib.sha256(digest_prefix).hexdigest(),
                 prefix_length=len(digest_prefix),
+                raw_sha256=hashlib.sha256(first).hexdigest(),
+                raw_bytes=len(first),
                 oversized=False,
             )
             number += 1
@@ -213,10 +261,14 @@ def iter_bounded_lines(
 
         prefix = first[:OVERSIZED_PREVIEW_BYTES]
         suffix = bytearray(first[-OVERSIZED_PREVIEW_BYTES:])
+        raw_digest = hashlib.sha256(first)
+        raw_bytes = len(first)
         while not first.endswith(b"\n"):
             first = handle.readline(READ_CHUNK_BYTES)
             if not first:
                 break
+            raw_digest.update(first)
+            raw_bytes += len(first)
             suffix.extend(first)
             if len(suffix) > OVERSIZED_PREVIEW_BYTES:
                 del suffix[:-OVERSIZED_PREVIEW_BYTES]
@@ -229,6 +281,8 @@ def iter_bounded_lines(
             suffix=bytes(suffix),
             prefix_sha256=hashlib.sha256(digest_prefix).hexdigest(),
             prefix_length=len(digest_prefix),
+            raw_sha256=raw_digest.hexdigest(),
+            raw_bytes=raw_bytes,
             oversized=True,
         )
         number += 1
@@ -272,6 +326,30 @@ def _tool_text(row: dict[str, Any]) -> str:
     }:
         return ""
     return _text_fragments(payload)
+
+
+def evidence_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
+    """Render exact text fields plus verified attachment descriptors from a raw row."""
+
+    role, text = _message_role_and_text(row)
+    if role:
+        return role.replace("-fallback", ""), text
+    tool_text = _tool_text(row)
+    if tool_text:
+        return "tool", tool_text
+    if row.get("type") == "compacted" or (
+        row.get("type") == "event_msg"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == "context_compacted"
+    ):
+        return "compaction", _text_fragments(row.get("payload"), budget=40_000)
+    if row.get("type") == "session_meta":
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        metadata = {
+            key: payload.get(key) for key in ("id", "cwd", "project", "git_branch") if payload.get(key)
+        }
+        return "session", json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    return "", ""
 
 
 def _session_metadata(row: dict[str, Any], state: ParserState) -> None:
@@ -344,11 +422,26 @@ def parse_increment(
             state.next_line_number = line.number + 1
 
             if line.raw is None:
-                preview = _jsonish_preview(line)
-                if b'"type":"compacted"' in line.prefix or b'"type":"context_compacted"' in line.prefix:
-                    compactions.append((line.number, preview))
-                if state.pending_line_start:
-                    state.pending_assistant = _bounded_append(state.pending_assistant, preview)
+                oversized_role, oversized_text = oversized_evidence_text(line)
+                if b'"compacted"' in line.prefix or b'"context_compacted"' in line.prefix:
+                    compactions.append((line.number, oversized_text))
+                if oversized_role == "user":
+                    cleaned, turn_kind = _clean_user_text(oversized_text)
+                    if turn_kind != "meta":
+                        previous = _exchange_from_pending(path, state, line.number - 1)
+                        if previous:
+                            exchanges.append(previous)
+                        state.pending_line_start = line.number
+                        state.pending_timestamp = ""
+                        state.pending_user = cleaned
+                        state.pending_assistant = ""
+                        state.pending_turn_kind = turn_kind
+                        recent_canonical = ("user", cleaned)
+                elif oversized_role == "assistant" and state.pending_line_start:
+                    state.pending_assistant = _bounded_append(state.pending_assistant, oversized_text)
+                    recent_canonical = ("assistant", oversized_text)
+                elif state.pending_line_start:
+                    state.pending_assistant = _bounded_append(state.pending_assistant, oversized_text)
                 continue
             try:
                 row = json.loads(line.raw)

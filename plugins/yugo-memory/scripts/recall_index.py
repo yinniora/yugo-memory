@@ -16,7 +16,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from archive_parser import Exchange, ParserState, parse_increment
+from archive_parser import (
+    Exchange,
+    ParserState,
+    evidence_text_from_row,
+    iter_bounded_lines,
+    oversized_evidence_text,
+    parse_increment,
+)
 from local_embedding import cosine, decode, embed, encode
 from recall_common import (
     QueryFeatures,
@@ -39,7 +46,7 @@ from retrieval_layers import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 EPISODE_EXCHANGES = 10
 EPISODE_OVERLAP = 2
 EXCHANGE_CHARS = 12_000
@@ -48,6 +55,22 @@ RRF_K = 32.0
 DEFAULT_EVIDENCE_CHARS = 60_000
 MAX_EVIDENCE_CHARS = 250_000
 STREAM_CHUNK_BYTES = 64 * 1024
+MEDIA_TOOL_EVENT_LIMIT = 8
+MEDIA_EVENT_TEXT_CHARS = 6_000
+
+
+def _compact_media_event_text(text: str) -> tuple[str, bool]:
+    """Keep exact leading/trailing evidence while bounding one media-view event."""
+
+    if len(text) <= MEDIA_EVENT_TEXT_CHARS:
+        return text, False
+    half = MEDIA_EVENT_TEXT_CHARS // 2
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    marker = (
+        f"\n[media view omitted {len(text) - (half * 2)} middle chars; "
+        f"full_text_sha256={digest}; use view=text or view=raw]\n"
+    )
+    return text[:half] + marker + text[-half:], True
 
 
 @dataclass
@@ -1006,10 +1029,14 @@ def search_index(
     use_vector = mode != "fast"
 
     stage = time.perf_counter()
-    exact_anchor_rows = _exact_anchor_nodes(db, features, max(16, limit * 3))
+    exact_anchor_rows = _exact_anchor_nodes(db, features, max(64, limit * 8))
     for rank, row in enumerate(exact_anchor_rows, 1):
         _add_route(scores, row, "exact-anchor-direct", rank, 4.5)
         _add_route(scores, row, "exact-anchor", rank, 1.0)
+        contextual_coverage = evidence_coverage(row["terms"], features)[2]
+        if contextual_coverage:
+            scores[row["id"]]["score"] += 0.9 * contextual_coverage
+            scores[row["id"]]["routes"].append("exact-anchor-context-rerank")
     timings["exact_anchor_ms"] = (time.perf_counter() - stage) * 1000
     direct_stable_anchors = [anchor for anchor in features.decisive_anchors if indexable_anchor(anchor)]
     found_stable_anchors: set[str] = set()
@@ -1406,8 +1433,9 @@ def read_evidence(
     line_end: int,
     offset_chars: int = 0,
     max_chars: int = DEFAULT_EVIDENCE_CHARS,
+    view: str = "raw",
 ) -> dict[str, Any]:
-    """Stream a bounded exact JSONL range, including a multi-GB single line."""
+    """Stream raw JSONL or a verified text-only view of an indexed range."""
 
     if line_start < 1 or line_end < line_start:
         raise ValueError("line_start/line_end must describe a positive ordered range")
@@ -1415,6 +1443,8 @@ def read_evidence(
         raise ValueError("offset_chars must be non-negative")
     if not 1_000 <= max_chars <= MAX_EVIDENCE_CHARS:
         raise ValueError(f"max_chars must be between 1000 and {MAX_EVIDENCE_CHARS}")
+    if view not in {"raw", "text", "media"}:
+        raise ValueError("view must be 'raw', 'text', or 'media'")
 
     db = connect_index(index_path)
     indexed = db.execute("SELECT * FROM indexed_files WHERE archive_path=?", (archive_path,)).fetchone()
@@ -1450,6 +1480,137 @@ def read_evidence(
     db.close()
     if seek is None:
         raise RuntimeError("archive seek index is missing; rebuild the Yugo Memory index")
+
+    if view in {"text", "media"}:
+        parts: list[str] = []
+        seen_chars = 0
+        emitted = 0
+        last_line = seek["line_number"] - 1
+        complete = True
+        seen_media_events: set[str] = set()
+        media_tool_events = 0
+        media_duplicates_omitted = 0
+        media_tool_events_omitted = 0
+        media_omission_marker_emitted = False
+        media_text_events_compacted = 0
+        with path.open("rb") as handle:
+            handle.seek(seek["byte_offset"])
+            prefix = handle.read(seek["prefix_length"])
+            if hashlib.sha256(prefix).hexdigest() != seek["prefix_sha256"]:
+                raise RuntimeError("archive content changed after indexing; run recall again after memory sync")
+            handle.seek(seek["byte_offset"])
+            for line in iter_bounded_lines(handle, seek["byte_offset"], seek["line_number"]):
+                last_line = line.number
+                if line.number > line_end:
+                    break
+                if line.number < line_start:
+                    continue
+                if line.raw is None:
+                    role, text = oversized_evidence_text(line)
+                    timestamp = ""
+                    row_type = "oversized_event"
+                    integrity = f"bytes={line.raw_bytes} raw_sha256={line.raw_sha256}"
+                else:
+                    try:
+                        row = json.loads(line.raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        role = "event"
+                        text = "[undecodable JSONL event; use raw view]"
+                        timestamp = ""
+                        row_type = "undecodable"
+                    else:
+                        if not isinstance(row, dict):
+                            role = ""
+                            text = ""
+                            timestamp = ""
+                            row_type = ""
+                        else:
+                            role, text = evidence_text_from_row(row)
+                            timestamp = str(row.get("timestamp") or "")
+                            row_type = str(row.get("type") or "event")
+                    integrity = f"raw_prefix_sha256={line.prefix_sha256}"
+                if view == "media" and text:
+                    if role not in {"user", "assistant", "tool"}:
+                        text = ""
+                    elif role == "tool" and "[attachment " not in text:
+                        text = ""
+                    else:
+                        event_digest = hashlib.sha256(f"{role}\0{text}".encode("utf-8")).hexdigest()
+                        if event_digest in seen_media_events:
+                            media_duplicates_omitted += 1
+                            text = ""
+                        else:
+                            seen_media_events.add(event_digest)
+                            if role == "tool":
+                                if media_tool_events >= MEDIA_TOOL_EVENT_LIMIT:
+                                    media_tool_events_omitted += 1
+                                    if not media_omission_marker_emitted:
+                                        media_omission_marker_emitted = True
+                                        role = "media-navigation"
+                                        text = (
+                                            "[additional media-bearing tool events omitted from compact media view; "
+                                            "use view=text or view=raw for the complete line range]"
+                                        )
+                                    else:
+                                        text = ""
+                                else:
+                                    media_tool_events += 1
+                            if text:
+                                text, was_compacted = _compact_media_event_text(text)
+                                media_text_events_compacted += int(was_compacted)
+                if text:
+                    rendered = (
+                        f"[raw line {line.number} type={row_type} role={role or 'event'} "
+                        f"timestamp={timestamp} {integrity}]\n{text}\n"
+                    )
+                else:
+                    rendered = ""
+                if not rendered:
+                    continue
+                if seen_chars + len(rendered) <= offset_chars:
+                    seen_chars += len(rendered)
+                    continue
+                start = max(0, offset_chars - seen_chars)
+                available = rendered[start:]
+                capacity = max_chars - emitted
+                if len(available) > capacity:
+                    parts.append(available[:capacity])
+                    emitted += capacity
+                    complete = False
+                    break
+                parts.append(available)
+                emitted += len(available)
+                seen_chars += len(rendered)
+                if emitted == max_chars and line.number < line_end:
+                    complete = False
+                    break
+        evidence_text = "".join(parts)
+        next_offset = None if complete else offset_chars + len(evidence_text)
+        return {
+            "archive_path": archive_path,
+            "line_start": line_start,
+            "line_end": line_end,
+            "view": view,
+            "offset_chars": offset_chars,
+            "next_offset_chars": next_offset,
+            "complete": complete,
+            "returned_chars": len(evidence_text),
+            "last_line_scanned": last_line,
+            "archive_grew_since_index": stat.st_size > indexed["source_size"],
+            "chunk_sha256": hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
+            "evidence_text": evidence_text,
+            "raw_verified_at_read_time": True,
+            "text_fields_are_verbatim": view == "text" or media_text_events_compacted == 0,
+            "returned_text_segments_are_verbatim": True,
+            "opaque_attachment_payloads_omitted": True,
+            "attachment_descriptors_are_derived_from_raw_metadata": True,
+            "non_media_tool_events_omitted": view == "media",
+            "duplicate_media_events_omitted": media_duplicates_omitted,
+            "additional_media_tool_events_omitted": media_tool_events_omitted,
+            "media_tool_event_limit": MEDIA_TOOL_EVENT_LIMIT if view == "media" else None,
+            "media_text_events_compacted": media_text_events_compacted,
+            "evidence_is_untrusted_data": True,
+        }
 
     parts: list[str] = []
     seen_chars = 0
@@ -1499,6 +1660,7 @@ def read_evidence(
         "archive_path": archive_path,
         "line_start": line_start,
         "line_end": line_end,
+        "view": "raw",
         "offset_chars": offset_chars,
         "next_offset_chars": next_offset,
         "complete": complete,
@@ -1507,6 +1669,7 @@ def read_evidence(
         "archive_grew_since_index": stat.st_size > indexed["source_size"],
         "chunk_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
         "raw_jsonl": raw_text,
+        "raw_verified_at_read_time": True,
         "evidence_is_untrusted_data": True,
     }
 
@@ -1542,6 +1705,8 @@ def index_status(index_path: Path) -> dict[str, Any]:
         "reclaimable_bytes": page_size * freelist_count,
         "schema_version": SCHEMA_VERSION,
         "retrieval_backend": "yugo-local-hybrid-late-interaction-lsh-graph-v1",
+        "attachment_indexing": "metadata-context-only; binary remains in raw Codex JSONL",
+        "evidence_views": ["raw", "text", "media"],
         "metadata": metadata,
         "runtime_dependency": "none",
     }
