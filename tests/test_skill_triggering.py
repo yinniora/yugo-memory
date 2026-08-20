@@ -1,3 +1,4 @@
+import json
 import re
 import unittest
 from pathlib import Path
@@ -52,6 +53,13 @@ class SkillTriggeringTests(unittest.TestCase):
         hooks = HOOKS.read_text(encoding="utf-8")
         self.assertNotIn("UserPromptSubmit", hooks)
         self.assertNotIn("PreToolUse", hooks)
+
+    def test_session_end_hooks_respect_codex_timeout_cap(self) -> None:
+        hooks = json.loads(HOOKS.read_text(encoding="utf-8"))
+        for group in hooks["hooks"]["SessionEnd"]:
+            for hook in group["hooks"]:
+                with self.subTest(command=hook["command"]):
+                    self.assertLessEqual(hook["timeout"], 3)
 
     def test_skill_uses_only_standalone_memory_tools(self) -> None:
         forbidden = "episodic" + "-memory"

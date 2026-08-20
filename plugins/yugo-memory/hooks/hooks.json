@@ -46,7 +46,7 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/scripts/task-lifecycle.mjs\"",
-            "timeout": 10,
+            "timeout": 3,
             "statusMessage": "Clearing completed task continuity state"
           },
           {
