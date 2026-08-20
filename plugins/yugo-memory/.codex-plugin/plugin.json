@@ -1,7 +1,7 @@
 {
   "name": "yugo-memory",
-  "version": "1.3.0+codex.20260814052323",
-  "description": "Private, event-driven, full-fidelity conversation memory with calibrated local hybrid recall.",
+  "version": "1.4.0+codex.20260820v140",
+  "description": "Private cross-agent conversation recall, adaptive context budgeting, task continuity, and evidence-linked experience memory.",
   "author": {
     "name": "Yuguo",
     "url": "https://github.com/yinniora"
@@ -14,6 +14,9 @@
     "memory",
     "compaction",
     "conversation",
+    "qoder",
+    "task-continuity",
+    "experience",
     "standalone",
     "local-search"
   ],
@@ -21,8 +24,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Yugo Memory",
-    "shortDescription": "Preserve long conversations and recall exact evidence quickly.",
-    "longDescription": "Stores only conversations that cross Codex's compaction boundary, keeps raw JSONL as the source of truth, and combines exact-anchor lookup, multilingual FTS, multi-facet late interaction, LSH and graph routing, all-file descriptors, visible tool/code/command evidence indexing, calibrated evidence selection, incremental indexing, and bounded raw or text verification without a server.",
+    "shortDescription": "Keep long Codex and Qoder tasks aligned with exact, budgeted recall.",
+    "longDescription": "Shares one protected local memory across Codex and Qoder, keeps raw JSONL as the source of truth, adapts recall output to each task's context window, maintains an ephemeral instruction checklist, and stores versioned evidence-linked workflow experience. Exact-anchor lookup, multilingual FTS, local late interaction, LSH, graph routing, typed file/tool evidence, and bounded raw verification remain dependency-free.",
     "developerName": "Yuguo",
     "category": "Productivity",
     "capabilities": [
@@ -31,7 +34,8 @@
     ],
     "defaultPrompt": [
       "Show the current long-memory status.",
-      "Recall the exact decisions from our earlier long conversation."
+      "Recall the exact decisions from our earlier long conversation.",
+      "Keep this long task aligned with my active constraints."
     ]
   }
 }

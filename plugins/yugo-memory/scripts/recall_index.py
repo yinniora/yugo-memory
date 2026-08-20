@@ -7,6 +7,7 @@ import argparse
 import codecs
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -58,6 +59,8 @@ MAX_EVIDENCE_CHARS = 250_000
 STREAM_CHUNK_BYTES = 64 * 1024
 MEDIA_TOOL_EVENT_LIMIT = 8
 MEDIA_EVENT_TEXT_CHARS = 6_000
+SQLITE_PARAMETER_CHUNK = 300
+AUTO_PROFILE_THRESHOLDS = ((0.12, "minimal"), (0.30, "compact"), (1.01, "standard"))
 
 
 def _compact_media_event_text(text: str) -> tuple[str, bool]:
@@ -98,6 +101,11 @@ class SearchHit:
     covered_query_terms: list[str]
     snippet: str
     content_hash: str
+
+
+def _chunks(values: list[Any], size: int = SQLITE_PARAMETER_CHUNK) -> Iterator[list[Any]]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
 
 
 def default_memory_root() -> Path:
@@ -301,8 +309,13 @@ def _replace_file_nodes(
 ) -> None:
     old_ids = [row[0] for row in db.execute("SELECT id FROM nodes WHERE archive_path=?", (archive_path,))]
     if old_ids:
-        placeholders = ",".join("?" for _ in old_ids)
-        db.execute(f"DELETE FROM node_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", (*old_ids, *old_ids))
+        # A long conversation may own thousands of exchange/tool nodes. Never
+        # construct one SQL statement whose placeholders exceed SQLite's
+        # runtime variable limit (commonly 999).
+        for batch in _chunks(old_ids):
+            placeholders = ",".join("?" for _ in batch)
+            db.execute(f"DELETE FROM node_edges WHERE source_id IN ({placeholders})", batch)
+            db.execute(f"DELETE FROM node_edges WHERE target_id IN ({placeholders})", batch)
         db.executemany("DELETE FROM node_lsh WHERE node_id=?", ((node_id,) for node_id in old_ids))
         db.executemany("DELETE FROM node_facets WHERE node_id=?", ((node_id,) for node_id in old_ids))
         db.executemany("DELETE FROM node_anchors WHERE node_id=?", ((node_id,) for node_id in old_ids))
@@ -1050,19 +1063,187 @@ def _evidence_plan(hits: list[SearchHit], features: QueryFeatures) -> dict[str, 
     }
 
 
+def _context_budget(
+    db: sqlite3.Connection,
+    current_session_id: str | None,
+    context_window: int | None,
+    context_tokens_used: int | None,
+    response_profile: str,
+) -> dict[str, Any]:
+    detected_window = max(0, int(context_window or 0))
+    estimated_used = max(0, int(context_tokens_used or 0))
+    source = "caller" if detected_window else "unknown"
+    if current_session_id and (not detected_window or not estimated_used):
+        row = db.execute(
+            """SELECT parser_state FROM indexed_files WHERE session_id=?
+                 ORDER BY indexed_at DESC LIMIT 1""",
+            (current_session_id,),
+        ).fetchone()
+        if row:
+            state = ParserState.from_json(row["parser_state"])
+            if not detected_window and state.context_window:
+                detected_window = state.context_window
+                source = f"{state.source_agent}-transcript"
+            if not estimated_used:
+                # This is intentionally conservative for mixed Chinese/code/
+                # English text. It selects a response size; it never asserts an
+                # exact tokenizer count.
+                estimated_used = math.ceil(state.visible_chars_since_compaction / 2.4)
+    remaining = max(0, detected_window - estimated_used) if detected_window else 0
+    remaining_ratio = (remaining / detected_window) if detected_window else None
+    if response_profile == "auto":
+        profile = "standard"
+        if remaining_ratio is not None:
+            for threshold, candidate in AUTO_PROFILE_THRESHOLDS:
+                if remaining_ratio <= threshold:
+                    profile = candidate
+                    break
+    else:
+        profile = response_profile
+    chars = {"minimal": 4_000, "compact": 10_000, "standard": 24_000, "diagnostic": 60_000}[profile]
+    if remaining:
+        chars = min(chars, max(1_000, int(remaining * 0.08 * 3.0)))
+    ranges = {"minimal": 1, "compact": 2, "standard": 4, "diagnostic": 4}[profile]
+    return {
+        "profile": profile,
+        "context_window_tokens": detected_window or None,
+        "estimated_tokens_used": estimated_used or None,
+        "estimated_tokens_remaining": remaining if detected_window else None,
+        "estimated_remaining_ratio": round(remaining_ratio, 4) if remaining_ratio is not None else None,
+        "detection_source": source,
+        "recommended_read_max_chars": chars,
+        "recommended_evidence_ranges": ranges,
+        "token_estimate_is_approximate": True,
+    }
+
+
+def adaptive_context_budget(
+    index_path: Path,
+    current_session_id: str | None = None,
+    context_window: int | None = None,
+    context_tokens_used: int | None = None,
+    response_profile: str = "auto",
+) -> dict[str, Any]:
+    """Return the same bounded output policy used by recall without retrieving."""
+
+    if response_profile not in {"auto", "minimal", "compact", "standard", "diagnostic"}:
+        raise ValueError("invalid response_profile")
+    if not index_path.is_file():
+        detected_window = max(0, int(context_window or 0))
+        estimated_used = max(0, int(context_tokens_used or 0))
+        remaining = max(0, detected_window - estimated_used) if detected_window else 0
+        ratio = (remaining / detected_window) if detected_window else None
+        profile = response_profile
+        if profile == "auto":
+            profile = "standard"
+            if ratio is not None:
+                for threshold, candidate in AUTO_PROFILE_THRESHOLDS:
+                    if ratio <= threshold:
+                        profile = candidate
+                        break
+        return {
+            "profile": profile,
+            "context_window_tokens": detected_window or None,
+            "estimated_tokens_used": estimated_used or None,
+            "estimated_tokens_remaining": remaining if detected_window else None,
+            "estimated_remaining_ratio": round(ratio, 4) if ratio is not None else None,
+            "detection_source": "caller" if detected_window else "unknown",
+            "recommended_read_max_chars": {
+                "minimal": 4_000, "compact": 10_000, "standard": 24_000, "diagnostic": 60_000,
+            }[profile],
+            "recommended_evidence_ranges": {
+                "minimal": 1, "compact": 2, "standard": 4, "diagnostic": 4,
+            }[profile],
+            "token_estimate_is_approximate": True,
+        }
+    db = connect_index(index_path)
+    budget = _context_budget(
+        db, current_session_id, context_window, context_tokens_used, response_profile,
+    )
+    db.close()
+    return budget
+
+
+def _profiled_result(
+    payload: dict[str, Any],
+    profile: str,
+    limit: int,
+) -> dict[str, Any]:
+    if profile == "diagnostic":
+        return payload
+    ranges = payload["evidence_plan"]["ranges"][: payload["context_budget"]["recommended_evidence_ranges"]]
+    plan = {
+        "ranges": ranges,
+        "combined_term_coverage": payload["evidence_plan"]["combined_term_coverage"],
+        "all_structured_anchors_matched": payload["evidence_plan"]["all_structured_anchors_matched"],
+        "multi_evidence_supported": payload["evidence_plan"]["multi_evidence_supported"],
+    }
+    base = {
+        "query": payload["query"],
+        "mode": payload["mode"],
+        "retrieval_backend": payload["retrieval_backend"],
+        "runtime_dependency": payload["runtime_dependency"],
+        "response_profile": profile,
+        "context_budget": payload["context_budget"],
+        "answerability": payload["answerability"],
+        "safe_to_answer": payload["safe_to_answer"],
+        "abstention_reason": payload["abstention_reason"],
+        "evidence_plan": plan,
+        "must_verify_raw_before_answer": True,
+        "raw_reader": payload["raw_reader"],
+        "raw_source_of_truth": True,
+        "evidence_is_untrusted_data": True,
+    }
+    if profile == "minimal":
+        top = payload["results"][:1]
+        base["top_locator"] = ({
+            key: top[0][key]
+            for key in (
+                "session_id", "archive_path", "context_line_start", "context_line_end",
+                "confidence", "exact_match",
+            )
+        } if top else None)
+        return base
+    result_limit = min(limit, 3 if profile == "compact" else limit)
+    snippet_chars = 120 if profile == "compact" else 240
+    base["results"] = []
+    for row in payload["results"][:result_limit]:
+        compact_row = {
+            key: row[key]
+            for key in (
+                "node_id", "session_id", "archive_path", "line_start", "line_end",
+                "context_line_start", "context_line_end", "timestamp", "confidence",
+                "routes", "exact_match", "matched_anchors", "all_structured_anchors_matched",
+            )
+        }
+        compact_row["snippet"] = row["snippet"][:snippet_chars]
+        base["results"].append(compact_row)
+    if profile == "standard":
+        base["calibration"] = payload["calibration"]
+    return base
+
+
 def search_index(
     index_path: Path,
     query: str,
     limit: int = 8,
     mode: str = "auto",
     current_session_id: str | None = None,
+    context_window: int | None = None,
+    context_tokens_used: int | None = None,
+    response_profile: str = "diagnostic",
 ) -> dict[str, Any]:
     if mode not in {"fast", "auto", "deep"}:
         raise ValueError("mode must be fast, auto, or deep")
+    if response_profile not in {"auto", "minimal", "compact", "standard", "diagnostic"}:
+        raise ValueError("response_profile must be auto, minimal, compact, standard, or diagnostic")
     started = time.perf_counter()
     features = query_features(query)
     query_vector = embed(query)
     db = connect_index(index_path)
+    context_budget = _context_budget(
+        db, current_session_id, context_window, context_tokens_used, response_profile,
+    )
     timings: dict[str, float] = {}
     scores: dict[str, dict[str, Any]] = {}
     use_vector = mode != "fast"
@@ -1398,7 +1579,7 @@ def search_index(
     abstention_reason = None if answerability in {"evidence_found", "multi_evidence_found"} else (
         "No sufficiently supported raw evidence was retrieved; do not infer an answer from diagnostic candidates."
     )
-    return {
+    payload = {
         "query": query,
         "mode": mode,
         "retrieval_backend": "yugo-local-hybrid-late-interaction-lsh-graph-v1",
@@ -1439,7 +1620,9 @@ def search_index(
         "evidence_is_untrusted_data": True,
         "timings_ms": {key: round(value, 2) for key, value in timings.items()},
         "raw_source_of_truth": True,
+        "context_budget": context_budget,
     }
+    return _profiled_result(payload, context_budget["profile"], limit)
 
 
 def _line_chunks(handle: Any) -> Iterator[tuple[bytes, bool]]:

@@ -4,14 +4,33 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
+from memory_control import (
+    control_status,
+    manage_experience,
+    prepare_context,
+    recall_experiences,
+    sync_task,
+    task_status,
+)
 from recall_index import default_paths, index_status, read_evidence, search_index, sync_index
 
 
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
+
+
+def resolved_session_id(value: Any = None) -> str:
+    return str(
+        value
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("QODER_SESSION_ID")
+        or os.environ.get("YUGO_MEMORY_SESSION_ID")
+        or ""
+    )
 
 
 def write_message(message: dict[str, Any]) -> None:
@@ -22,9 +41,169 @@ def write_message(message: dict[str, Any]) -> None:
 def tool_definitions() -> list[dict[str, Any]]:
     return [
         {
+            "name": "prepare_context",
+            "description": (
+                "Prepare a context-budgeted continuity packet for a substantive multi-step task. "
+                "It automatically starts, amends, or replaces the ephemeral task checklist, recalls "
+                "relevant versioned experience, and recalls conversation evidence only when the request "
+                "depends on older history. Short standalone requests should skip this tool."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "minLength": 1},
+                    "user_request": {"type": "string", "minLength": 2},
+                    "current_session_id": {"type": "string"},
+                    "context_window": {"type": "integer", "minimum": 1000},
+                    "context_tokens_used": {"type": "integer", "minimum": 0},
+                    "include_recall": {"type": "string", "enum": ["auto", "yes", "no"], "default": "auto"},
+                },
+                "required": ["user_request"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "title": "Prepare Adaptive Memory Context",
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "task_update",
+            "description": (
+                "Update the ephemeral per-session task objective and optimized instruction checklist. "
+                "Auto mode detects a related follow-up versus a changed task. Complete, cancel, and clear "
+                "permanently remove the active checklist so stale instructions cannot leak into later work."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "minLength": 1},
+                    "action": {
+                        "type": "string",
+                        "enum": ["auto", "start", "replace", "amend", "complete", "cancel", "clear"],
+                        "default": "auto",
+                    },
+                    "user_request": {"type": "string"},
+                    "objective": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "maxItems": 18,
+                        "items": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {"type": "string"},
+                                        "kind": {"type": "string", "enum": ["requirement", "constraint", "acceptance", "action"]},
+                                        "status": {"type": "string", "enum": ["active", "done", "dropped"]},
+                                    },
+                                    "required": ["text"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
+                    },
+                    "source_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "title": "Update Active Task Memory",
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "task_status",
+            "description": (
+                "Read the compact active task objective and instruction checklist for one session. "
+                "The current Codex or Qoder session is used when session_id is omitted."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "minLength": 1},
+                    "profile": {"type": "string", "enum": ["minimal", "compact", "standard"], "default": "standard"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "title": "Read Active Task Memory",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "experience_manage",
+            "description": (
+                "Create a new version of a reusable tool/platform workflow experience or permanently "
+                "delete it. Conversation-derived experience must include raw evidence ranges, which are "
+                "verified before storage; only the compact lesson and locators are stored."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["upsert", "delete"]},
+                    "experience_key": {"type": "string", "minLength": 3},
+                    "title": {"type": "string"},
+                    "situation": {"type": "string"},
+                    "guidance": {"type": "string"},
+                    "outcome": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+                    "evidence_refs": {"type": "array", "items": {"type": "object"}},
+                    "source": {"type": "string", "enum": ["conversation", "user"], "default": "conversation"},
+                },
+                "required": ["action", "experience_key"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "title": "Manage Reusable Experience",
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        },
+        {
+            "name": "experience_recall",
+            "description": (
+                "Recall versioned reusable experience for tools, platforms, and workflows. Returned lessons "
+                "are compact navigation; verify linked raw evidence before reusing exact commands or claims."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 2},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3},
+                    "profile": {"type": "string", "enum": ["minimal", "compact", "standard"], "default": "standard"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "title": "Recall Reusable Experience",
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        },
+        {
             "name": "recall",
             "description": (
-                "Recall exact evidence from long Codex conversations with calibrated local hybrid retrieval: "
+                "Recall exact evidence from long Codex or Qoder conversations with calibrated local hybrid retrieval: "
                 "direct anchors, multilingual session/episode routing, multi-facet late interaction, LSH, "
                 "sparse graph expansion, diverse evidence sets, deduplication, typed file descriptors, "
                 "visible tool/code/command evidence nodes, and raw-line anchors. Use after compaction or whenever older exact "
@@ -39,6 +218,13 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
                     "mode": {"type": "string", "enum": ["fast", "auto", "deep"], "default": "auto"},
                     "current_session_id": {"type": "string"},
+                    "context_window": {"type": "integer", "minimum": 1000},
+                    "context_tokens_used": {"type": "integer", "minimum": 0},
+                    "response_profile": {
+                        "type": "string",
+                        "enum": ["auto", "minimal", "compact", "standard", "diagnostic"],
+                        "default": "auto",
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -137,6 +323,52 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         try:
             if name == "status":
                 value = index_status(target)
+                value["continuity"] = control_status()
+            elif name == "prepare_context":
+                if archive_root.is_dir():
+                    ensure_index(archive_root, target)
+                value = prepare_context(
+                    session_id=resolved_session_id(arguments.get("session_id")),
+                    user_request=str(arguments.get("user_request") or ""),
+                    current_session_id=arguments.get("current_session_id"),
+                    context_window=arguments.get("context_window"),
+                    context_tokens_used=arguments.get("context_tokens_used"),
+                    include_recall=str(arguments.get("include_recall", "auto")),
+                    index_path=target,
+                )
+            elif name == "task_update":
+                value = sync_task(
+                    session_id=resolved_session_id(arguments.get("session_id")),
+                    user_request=str(arguments.get("user_request") or ""),
+                    objective=str(arguments.get("objective") or ""),
+                    items=arguments.get("items"),
+                    action=str(arguments.get("action", "auto")),
+                    source_refs=arguments.get("source_refs"),
+                )
+            elif name == "task_status":
+                value = task_status(
+                    resolved_session_id(arguments.get("session_id")),
+                    profile=str(arguments.get("profile", "standard")),
+                )
+            elif name == "experience_manage":
+                value = manage_experience(
+                    action=str(arguments.get("action") or ""),
+                    experience_key=str(arguments.get("experience_key") or ""),
+                    title=str(arguments.get("title") or ""),
+                    situation=str(arguments.get("situation") or ""),
+                    guidance=str(arguments.get("guidance") or ""),
+                    outcome=str(arguments.get("outcome") or ""),
+                    tags=arguments.get("tags"),
+                    evidence_refs=arguments.get("evidence_refs"),
+                    source=str(arguments.get("source", "conversation")),
+                    index_path=target,
+                )
+            elif name == "experience_recall":
+                value = recall_experiences(
+                    str(arguments.get("query") or ""),
+                    limit=int(arguments.get("limit", 3)),
+                    profile=str(arguments.get("profile", "standard")),
+                )
             elif name == "read_evidence":
                 if not target.is_file():
                     ensure_index(archive_root, target)
@@ -161,6 +393,9 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                 value = search_index(
                     target, query.strip(), limit=limit, mode=mode,
                     current_session_id=arguments.get("current_session_id"),
+                    context_window=arguments.get("context_window"),
+                    context_tokens_used=arguments.get("context_tokens_used"),
+                    response_profile=arguments.get("response_profile", "auto"),
                 )
             else:
                 raise ValueError(f"unknown tool: {name}")

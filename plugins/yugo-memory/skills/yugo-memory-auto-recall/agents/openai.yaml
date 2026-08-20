@@ -1,6 +1,6 @@
 interface:
-  display_name: "Yugo Memory Auto Recall"
-  short_description: "Recall exact evidence from long or earlier chats"
-  default_prompt: "Use $yugo-memory-auto-recall to recover exact evidence from an earlier conversation."
+  display_name: "Yugo Memory Continuity"
+  short_description: "Keep long tasks aligned and recall exact evidence"
+  default_prompt: "Use $yugo-memory-auto-recall to preserve this task's constraints and recover exact earlier evidence."
 policy:
   allow_implicit_invocation: true

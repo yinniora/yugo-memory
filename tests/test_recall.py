@@ -403,7 +403,10 @@ class RecallTests(unittest.TestCase):
         )
         response = json.loads(run.stdout)
         names = {tool["name"] for tool in response["result"]["tools"]}
-        self.assertEqual(names, {"recall", "read_evidence", "status"})
+        self.assertEqual(names, {
+            "recall", "read_evidence", "status", "prepare_context", "task_update",
+            "task_status", "experience_manage", "experience_recall",
+        })
         recall = next(tool for tool in response["result"]["tools"] if tool["name"] == "recall")
         self.assertNotIn("dense_candidates", recall["inputSchema"]["properties"])
         evidence = next(tool for tool in response["result"]["tools"] if tool["name"] == "read_evidence")
