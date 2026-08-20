@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ from archive_parser import ParserState  # noqa: E402
 from local_embedding import cosine_vectors, embed  # noqa: E402
 from recall_common import extract_terms, query_features  # noqa: E402
 from recall_index import connect_index, index_status, read_evidence, search_index, sync_index  # noqa: E402
+from recall_mcp import handle as mcp_handle  # noqa: E402
 from retrieval_layers import exchange_facets, late_interaction_score, query_facets  # noqa: E402
 
 
@@ -139,7 +141,68 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(status["evidence_views"], ["raw", "text", "media"])
         self.assertIn("metadata/context only", status["attachment_indexing"])
         self.assertIn("hidden reasoning excluded", status["tool_evidence_indexing"])
+        self.assertEqual(status["snapshot_policy"], "last-committed-nonblocking")
         self.assertNotIn("atlas-catalog-v7", json.dumps(status))
+
+    def test_recall_reads_committed_snapshot_while_background_writer_holds_lock(self) -> None:
+        writer = sqlite3.connect(self.index_db, timeout=0.1, isolation_level=None)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE metadata SET value=value WHERE key='last_indexed_at'"
+        )
+        try:
+            started = time.perf_counter()
+            status = index_status(self.index_db)
+            result = search_index(self.index_db, "a1b2c3d", mode="auto", limit=3)
+            elapsed = time.perf_counter() - started
+            self.assertTrue(status["ready"])
+            self.assertTrue(result["safe_to_answer"])
+            self.assertEqual(result["snapshot_policy"], "last-committed-nonblocking")
+            self.assertLess(elapsed, 2.0)
+
+            with patch.dict(os.environ, {"YUGO_MEMORY_HOME": str(self.root)}):
+                started = time.perf_counter()
+                response = mcp_handle({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "recall",
+                        "arguments": {"query": "a1b2c3d", "response_profile": "compact"},
+                    },
+                })
+                elapsed = time.perf_counter() - started
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertFalse(response["result"]["isError"])
+            self.assertTrue(payload["safe_to_answer"])
+            self.assertEqual(payload["snapshot_policy"], "last-committed-nonblocking")
+            self.assertLess(elapsed, 2.0)
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+
+    def test_mcp_recall_without_index_fails_fast_without_creating_one(self) -> None:
+        empty_root = self.root / "empty-memory"
+        empty_root.mkdir()
+        started = time.perf_counter()
+        with patch.dict(os.environ, {"YUGO_MEMORY_HOME": str(empty_root)}):
+            response = mcp_handle({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall",
+                    "arguments": {"query": "虚构的早期决定"},
+                },
+            })
+        elapsed = time.perf_counter() - started
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(payload["answerability"], "index_not_ready")
+        self.assertFalse(payload["safe_to_answer"])
+        self.assertFalse((empty_root / "index.sqlite").exists())
+        self.assertLess(elapsed, 0.5)
 
     def test_exact_anchor_bypasses_semantic_uncertainty(self) -> None:
         result = search_index(self.index_db, "a1b2c3d", mode="auto", limit=3)
@@ -489,8 +552,10 @@ class RecallTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "changed after indexing"):
             read_evidence(self.index_db, str(self.atlas.resolve()), 1, 2)
 
-    def test_mcp_recall_syncs_archive_and_returns_evidence(self) -> None:
+    def test_mcp_recall_uses_published_snapshot_and_returns_evidence(self) -> None:
         target = self.root / "mcp-index.sqlite"
+        sync_index(self.archives, target)
+        before = target.stat().st_mtime_ns
         request = {
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "recall", "arguments": {"query": "a1b2c3d", "mode": "auto"}},
@@ -509,7 +574,9 @@ class RecallTests(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(payload["safe_to_answer"])
         self.assertEqual(payload["runtime_dependency"], "none")
+        self.assertEqual(payload["snapshot_policy"], "last-committed-nonblocking")
         self.assertTrue(target.is_file())
+        self.assertEqual(target.stat().st_mtime_ns, before)
 
     def test_oversized_event_is_drained_with_bounded_preview(self) -> None:
         archive = self.archives / "2038" / "rollout-huge-55555555-5555-4555-8555-555555555555.jsonl"

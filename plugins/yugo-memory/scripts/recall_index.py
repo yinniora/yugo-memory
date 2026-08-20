@@ -142,6 +142,42 @@ def connect_index(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def connect_index_readonly(path: Path) -> sqlite3.Connection:
+    """Open the last committed index snapshot without contending with its writer.
+
+    Recall/status calls must never initialize, migrate, or otherwise write the
+    index.  WAL readers can continue to use the last committed snapshot while a
+    hook updates the next snapshot in the background.
+    """
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            "Yugo Memory index is not ready; background maintenance has not published a snapshot yet"
+        )
+    connection = sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=ro",
+        uri=True,
+        timeout=0.1,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        current = connection.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()
+        if current is None:
+            raise RuntimeError("Yugo Memory index snapshot is not initialized")
+        if int(current[0]) != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"recall index schema {current[0]} is incompatible with {SCHEMA_VERSION}; "
+                "wait for background maintenance to rebuild it"
+            )
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
 def create_schema(db: sqlite3.Connection) -> None:
     db.executescript(
         """
@@ -1156,7 +1192,7 @@ def adaptive_context_budget(
             }[profile],
             "token_estimate_is_approximate": True,
         }
-    db = connect_index(index_path)
+    db = connect_index_readonly(index_path)
     budget = _context_budget(
         db, current_session_id, context_window, context_tokens_used, response_profile,
     )
@@ -1183,6 +1219,7 @@ def _profiled_result(
         "mode": payload["mode"],
         "retrieval_backend": payload["retrieval_backend"],
         "runtime_dependency": payload["runtime_dependency"],
+        "snapshot_policy": payload["snapshot_policy"],
         "response_profile": profile,
         "context_budget": payload["context_budget"],
         "answerability": payload["answerability"],
@@ -1240,7 +1277,7 @@ def search_index(
     started = time.perf_counter()
     features = query_features(query)
     query_vector = embed(query)
-    db = connect_index(index_path)
+    db = connect_index_readonly(index_path)
     context_budget = _context_budget(
         db, current_session_id, context_window, context_tokens_used, response_profile,
     )
@@ -1584,6 +1621,7 @@ def search_index(
         "mode": mode,
         "retrieval_backend": "yugo-local-hybrid-late-interaction-lsh-graph-v1",
         "runtime_dependency": "none",
+        "snapshot_policy": "last-committed-nonblocking",
         "local_vector_used": use_vector,
         "direct_anchor_bypass": direct_only,
         "direct_anchor_absence_bypass": direct_absent,
@@ -1668,7 +1706,7 @@ def read_evidence(
     if view not in {"raw", "text", "media"}:
         raise ValueError("view must be 'raw', 'text', or 'media'")
 
-    db = connect_index(index_path)
+    db = connect_index_readonly(index_path)
     indexed = db.execute("SELECT * FROM indexed_files WHERE archive_path=?", (archive_path,)).fetchone()
     if indexed is None:
         db.close()
@@ -1898,8 +1936,13 @@ def read_evidence(
 
 def index_status(index_path: Path) -> dict[str, Any]:
     if not index_path.is_file():
-        return {"ready": False, "index_path": str(index_path), "runtime_dependency": "none"}
-    db = connect_index(index_path)
+        return {
+            "ready": False,
+            "index_path": str(index_path),
+            "runtime_dependency": "none",
+            "snapshot_policy": "last-committed-nonblocking",
+        }
+    db = connect_index_readonly(index_path)
     counts = {
         row["level"]: row["count"]
         for row in db.execute("SELECT level, count(*) count FROM nodes GROUP BY level")
@@ -1936,6 +1979,7 @@ def index_status(index_path: Path) -> dict[str, Any]:
         "evidence_views": ["raw", "text", "media"],
         "metadata": metadata,
         "runtime_dependency": "none",
+        "snapshot_policy": "last-committed-nonblocking",
     }
 
 
