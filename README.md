@@ -4,7 +4,7 @@ Standalone, event-driven, full-fidelity long-conversation memory and task contin
 
 Codex conversations enter memory only after a real context-compaction event. Qoder conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
-Yugo Memory 1.4 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Yugo Memory 1.4.1 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
 
 ## Behavior
 
@@ -92,6 +92,7 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 - When the live agent source is available, any copied legacy candidate is replaced with a hard link to the current source.
 - Parser checkpoints store the next byte and line offsets plus the current unfinished exchange.
 - Append-only files resume at the prior byte offset; existing gigabytes are not parsed again.
+- Online recall, status, and evidence reads use SQLite's last committed read-only WAL snapshot. They never run index maintenance or wait for a background writer; a missing snapshot returns `index_not_ready` immediately instead of creating a database in the request path.
 - JSONL events larger than 8 MiB are drained in bounded chunks. Their prefix/suffix aid navigation while the complete bytes remain in raw storage.
 - Opaque base64/data-URL/hex payloads remain available in raw evidence but are replaced by typed, bounded attachment descriptors in navigation records, preventing images and binary tool output from inflating the index.
 - Codex compaction summaries improve routing but never replace raw evidence.
@@ -179,7 +180,7 @@ The plugin recognizes Codex `type=compacted` and `event_msg/context_compacted`, 
 
 Published releases contain no private query, expected phrase, transcript path, real-history fixture, or aggregate claim derived from a private conversation. Public CI uses independently invented fixtures only.
 
-The public regression suite covers Codex and Qoder lifecycle storage, adaptive context profiles, task replacement/clearing, experience version/update/delete, large-index SQL limits, migration, earliest/latest/Nth turns, exact paths and commits, CJK/English retrieval, role-preserving late interaction, LSH and graph routes, multi-range support, ambiguous numeric anchors, duplicates, prompt injection, append-only updates, rewritten-history rejection, unavailable evidence, MCP behavior, all major file families, ordinary and oversized media/tool events, full long-command/code/patch recall, attachment abstention, and bounded reads including a sparse 600 MiB JSONL line.
+The public regression suite covers Codex and Qoder lifecycle storage, adaptive context profiles, task replacement/clearing, experience version/update/delete, large-index SQL limits, migration, earliest/latest/Nth turns, exact paths and commits, CJK/English retrieval, role-preserving late interaction, LSH and graph routes, multi-range support, ambiguous numeric anchors, duplicates, prompt injection, append-only updates, rewritten-history rejection, unavailable evidence, nonblocking recall under an active SQLite writer, MCP behavior, all major file families, ordinary and oversized media/tool events, full long-command/code/patch recall, attachment abstention, and bounded reads including a sparse 600 MiB JSONL line.
 
 Hybrid retrieval moves work from query time into indexing. Compared with the previous standalone implementation, Yugo Memory stores additional facets, anchor postings, LSH buckets, and sparse graph edges. This improves recall and refusal behavior but increases initial build time and index size. Incremental checkpoints, bounded facets, and candidate generation keep later updates and queries controlled; exact identifiers and provably absent stable identifiers use the direct index instead of the full cascade.
 

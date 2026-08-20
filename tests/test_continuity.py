@@ -176,6 +176,15 @@ class ContinuityTests(unittest.TestCase):
         self.assertIsNone(payload["conversation_recall"])
         self.assertIsNotNone(payload["active_task"])
 
+    def test_prepare_context_reports_unready_index_without_building_it(self) -> None:
+        payload = prepare_context(
+            "session-c", "查找以前虚构星图任务中的精确决定。", include_recall="yes",
+            control_path=self.control, index_path=self.index,
+        )
+        self.assertEqual(payload["conversation_recall"]["answerability"], "index_not_ready")
+        self.assertFalse(payload["conversation_recall"]["safe_to_answer"])
+        self.assertFalse(self.index.exists())
+
     def test_qoder_adapter_round_trip_preserves_unrelated_configuration(self) -> None:
         qoder_home = self.root / "qoder-home"
         qoder_home.mkdir()

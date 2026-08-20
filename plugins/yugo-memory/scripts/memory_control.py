@@ -513,7 +513,7 @@ def prepare_context(
 ) -> dict[str, Any]:
     if include_recall not in {"auto", "yes", "no"}:
         raise ValueError("include_recall must be auto, yes, or no")
-    archive_root, resolved_index = default_paths()
+    _archive_root, resolved_index = default_paths()
     target = index_path or resolved_index
     budget = adaptive_context_budget(
         target, current_session_id or session_id, context_window, context_tokens_used, "auto"
@@ -531,8 +531,17 @@ def prepare_context(
     )
     recall = None
     if should_recall:
-        if not target.is_file() and not archive_root.is_dir():
-            recall = {"answerability": "insufficient_evidence", "safe_to_answer": False}
+        if not target.is_file():
+            recall = {
+                "answerability": "index_not_ready",
+                "safe_to_answer": False,
+                "index_snapshot_available": False,
+                "abstention_reason": (
+                    "Background memory maintenance has not published an index snapshot yet; "
+                    "do not infer an answer from unavailable history."
+                ),
+                "snapshot_policy": "last-committed-nonblocking",
+            }
         else:
             recall = search_index(
                 target, user_request, limit=4, mode="auto",

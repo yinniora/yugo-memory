@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Any
 
 from memory_control import (
@@ -17,10 +16,10 @@ from memory_control import (
     sync_task,
     task_status,
 )
-from recall_index import default_paths, index_status, read_evidence, search_index, sync_index
+from recall_index import default_paths, index_status, read_evidence, search_index
 
 
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.4.1"
 
 
 def resolved_session_id(value: Any = None) -> str:
@@ -289,12 +288,6 @@ def result_content(value: Any, is_error: bool = False) -> dict[str, Any]:
     }
 
 
-def ensure_index(archive_root: Path, target: Path) -> None:
-    # sync_index is incremental: unchanged archives cost only directory/stat
-    # checks, while append-only sessions resume at their stored byte offset.
-    sync_index(archive_root, target)
-
-
 def handle(request: dict[str, Any]) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
@@ -319,14 +312,12 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         params = request.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        archive_root, target = default_paths()
+        _archive_root, target = default_paths()
         try:
             if name == "status":
                 value = index_status(target)
                 value["continuity"] = control_status()
             elif name == "prepare_context":
-                if archive_root.is_dir():
-                    ensure_index(archive_root, target)
                 value = prepare_context(
                     session_id=resolved_session_id(arguments.get("session_id")),
                     user_request=str(arguments.get("user_request") or ""),
@@ -371,7 +362,9 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                 )
             elif name == "read_evidence":
                 if not target.is_file():
-                    ensure_index(archive_root, target)
+                    raise FileNotFoundError(
+                        "Yugo Memory index is not ready; no verified evidence can be read yet"
+                    )
                 value = read_evidence(
                     target,
                     str(arguments.get("archive_path") or ""),
@@ -389,14 +382,26 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                 limit = int(arguments.get("limit", 8))
                 if not 1 <= limit <= 20:
                     raise ValueError("limit must be between 1 and 20")
-                ensure_index(archive_root, target)
-                value = search_index(
-                    target, query.strip(), limit=limit, mode=mode,
-                    current_session_id=arguments.get("current_session_id"),
-                    context_window=arguments.get("context_window"),
-                    context_tokens_used=arguments.get("context_tokens_used"),
-                    response_profile=arguments.get("response_profile", "auto"),
-                )
+                if not target.is_file():
+                    value = {
+                        "query": query.strip(),
+                        "answerability": "index_not_ready",
+                        "safe_to_answer": False,
+                        "index_snapshot_available": False,
+                        "abstention_reason": (
+                            "Background memory maintenance has not published an index snapshot yet; "
+                            "do not infer an answer from unavailable history."
+                        ),
+                        "snapshot_policy": "last-committed-nonblocking",
+                    }
+                else:
+                    value = search_index(
+                        target, query.strip(), limit=limit, mode=mode,
+                        current_session_id=arguments.get("current_session_id"),
+                        context_window=arguments.get("context_window"),
+                        context_tokens_used=arguments.get("context_tokens_used"),
+                        response_profile=arguments.get("response_profile", "auto"),
+                    )
             else:
                 raise ValueError(f"unknown tool: {name}")
             result = result_content(value)
