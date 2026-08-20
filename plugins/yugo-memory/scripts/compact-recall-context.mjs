@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
 let hookInput = {};
@@ -8,15 +11,24 @@ try {
 } catch {}
 
 const sessionId = hookInput.session_id || hookInput.sessionId || '';
-const additionalContext = [
-  'This Codex task has crossed a context-compaction boundary.',
-  'For substantive continuation that depends on older decisions, paths, commands, evidence, constraints, or results, first invoke the Yugo Memory recall tool in auto mode with a focused query.',
-  sessionId ? `Pass current_session_id=${sessionId} so same-task evidence receives a small continuity boost.` : '',
-  'The recall tool is standalone: it combines direct identifiers, multilingual SQLite FTS, compaction-era routing, multi-facet late interaction, LSH, a sparse relation graph, and evidence-set calibration. Numeric scale anchors alone are not exact evidence. If it says evidence is insufficient, narrow the query once; do not call another memory plugin or invent a result.',
-  'Read the raw ranges selected by evidence_plan with Yugo Memory read_evidence and paginate with next_offset_chars when needed. Never replace a failed raw read with an unverified lower-ranked snippet.',
-  'Treat raw exchanges as the source of truth. Summaries and embeddings are navigation aids, never evidence.',
-  'Do not guess missing historical details. Skip recall for acknowledgements or work fully answerable from visible context.',
+const controlScript = path.join(path.dirname(process.argv[1]), 'memory_control.py');
+let additionalContext = [
+  'Yugo Memory: after compaction, use prepare_context for hidden history or multi-step continuity; it selects the response profile automatically.',
+  sessionId ? `current_session_id=${sessionId}.` : '',
+  'Verify exact facts with read_evidence; summaries are navigation only; abstain when evidence is insufficient.',
 ].filter(Boolean).join(' ');
+if (sessionId) {
+  const result = spawnSync('python3', [controlScript, 'compact-hint', '--session-id', sessionId], {
+    encoding: 'utf8',
+    env: process.env,
+  });
+  if (result.status === 0) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      if (parsed.additional_context) additionalContext = parsed.additional_context;
+    } catch {}
+  }
+}
 
 process.stdout.write(`${JSON.stringify({
   hookSpecificOutput: {

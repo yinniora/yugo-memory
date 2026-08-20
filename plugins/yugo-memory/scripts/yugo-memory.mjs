@@ -19,6 +19,9 @@ const configBase = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.conf
 const memoryRoot = process.env.YUGO_MEMORY_HOME || path.join(configBase, 'yugo-memory');
 const sourceRoot = process.env.YUGO_MEMORY_SOURCE_DIR || path.join(codexHome, 'sessions');
 const archivedSourceRoot = process.env.YUGO_MEMORY_ARCHIVED_SOURCE_DIR || path.join(codexHome, 'archived_sessions');
+const qoderHome = process.env.QODER_HOME || path.join(os.homedir(), '.qoder');
+const qoderSourceRoot = process.env.YUGO_MEMORY_QODER_SOURCE_DIR || path.join(qoderHome, 'projects');
+const includeQoder = process.env.YUGO_MEMORY_INCLUDE_QODER !== '0';
 const archiveRoot = process.env.YUGO_MEMORY_ARCHIVE_DIR || path.join(memoryRoot, 'archives');
 const statePath = process.env.YUGO_MEMORY_STATE_PATH || path.join(memoryRoot, 'state.json');
 const indexDb = process.env.YUGO_MEMORY_INDEX_DB || path.join(memoryRoot, 'index.sqlite');
@@ -31,8 +34,11 @@ const legacyArchiveRoots = configuredLegacyRoot
       path.join(configBase, 'superpowers', 'conversation-archive'),
     ];
 const indexScript = path.join(path.dirname(process.argv[1]), 'recall_index.py');
+const parserScript = path.join(path.dirname(process.argv[1]), 'archive_parser.py');
 const deletedRetentionDays = Number(process.env.YUGO_MEMORY_DELETE_GRACE_DAYS || 7);
 const deletedRetentionMs = deletedRetentionDays * DAY_MS;
+const qoderLongRatio = Number(process.env.YUGO_MEMORY_QODER_LONG_RATIO || 0.35);
+const qoderMinimumTokens = Number(process.env.YUGO_MEMORY_QODER_MIN_TOKENS || 16000);
 const logDir = path.join(memoryRoot, 'logs');
 const logPath = path.join(logDir, 'yugo-memory.log');
 const lockPath = path.join(logDir, 'yugo-memory.lock');
@@ -143,13 +149,13 @@ function crossedCompactionBoundary(file) {
 
 function loadState() {
   if (!fs.existsSync(statePath)) {
-    return { schemaVersion: 4, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
+    return { schemaVersion: 5, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
   }
   try {
     const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     const compatible = Number(state?.schemaVersion || 0) >= 4;
     return {
-      schemaVersion: 4,
+      schemaVersion: 5,
       // v3 keyed these maps by relative paths. Resetting only delays final
       // deletion; it can never remove evidence before the configured grace.
       missingSince: compatible && state?.missingSince && typeof state.missingSince === 'object'
@@ -160,8 +166,20 @@ function loadState() {
         ? state.legacyMigrations : {},
     };
   } catch {
-    return { schemaVersion: 4, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
+    return { schemaVersion: 5, missingSince: {}, sourceStatus: {}, legacyMigrations: {} };
   }
+}
+
+function probeLongSource(file) {
+  const result = spawnSync('python3', [
+    parserScript, 'probe', '--input', file,
+    '--long-ratio', String(qoderLongRatio),
+    '--minimum-tokens', String(qoderMinimumTokens),
+  ], { encoding: 'utf8', env: process.env });
+  if (result.status !== 0) {
+    throw new Error(`conversation source probe failed (${result.status}): ${result.stderr}`);
+  }
+  return JSON.parse(result.stdout);
 }
 
 function saveState(state) {
@@ -365,6 +383,9 @@ function doctorReport() {
     codexHome,
     sourceRoot,
     sourceSessions: walkJsonl(sourceRoot).length,
+    qoderSourceRoot,
+    qoderSourceSessions: includeQoder ? walkJsonl(qoderSourceRoot).length : 0,
+    qoderEnabled: includeQoder,
     archivedSourceSessions: walkJsonl(archivedSourceRoot).length,
     codexStateDatabase: fs.existsSync(codexStateDb),
     codexThreadStateReadable: threadStates !== null,
@@ -384,45 +405,71 @@ function doctorReport() {
 async function main() {
   const activeSources = archivedSessionMap(sourceRoot);
   const archivedSources = archivedSessionMap(archivedSourceRoot);
+  const qoderSources = includeQoder ? archivedSessionMap(qoderSourceRoot) : new Map();
   const threadStates = loadThreadStates();
   const sources = new Map();
   for (const [sessionId, file] of activeSources) {
     const threadState = sessionId ? threadStates?.get(sessionId) : null;
-    if (!threadStates || (threadState && !threadState.archived)) sources.set(sessionId, file);
+    if (!threadStates || (threadState && !threadState.archived)) {
+      sources.set(sessionId, { file, sourceAgent: 'codex' });
+    }
+  }
+  for (const [sessionId, file] of qoderSources) {
+    // UUID collisions across independent agents are vanishingly unlikely. If
+    // one occurs, keep the Codex source and fail closed rather than merge two
+    // raw conversations under one identity.
+    if (!sources.has(sessionId)) sources.set(sessionId, { file, sourceAgent: 'qoder' });
   }
 
   const state = loadState();
   const legacyMigrations = await migrateLegacyArchives(state);
   const canonicalization = canonicalizeArchives();
   const longSources = new Map();
-  for (const [sessionId, file] of sources) {
+  for (const [sessionId, sourceInfo] of sources) {
+    const { file, sourceAgent } = sourceInfo;
     const stat = fs.statSync(file);
-    const cached = state.sourceStatus[sessionId];
+    const statusKey = `${sourceAgent}:${sessionId}`;
+    const cached = state.sourceStatus[statusKey] || state.sourceStatus[sessionId];
     let isLong;
     if (cached?.long === true) isLong = true;
     else if (cached?.size === stat.size && cached?.mtimeMs === stat.mtimeMs) isLong = false;
-    else isLong = await crossedCompactionBoundary(file);
-    state.sourceStatus[sessionId] = {
-      path: file, size: stat.size, mtimeMs: stat.mtimeMs, long: isLong,
+    else if (sourceAgent === 'codex') isLong = await crossedCompactionBoundary(file);
+    else isLong = Boolean(probeLongSource(file).long);
+    state.sourceStatus[statusKey] = {
+      path: file, size: stat.size, mtimeMs: stat.mtimeMs, long: isLong, sourceAgent,
     };
+    delete state.sourceStatus[sessionId];
     if (isLong) longSources.set(sessionId, file);
   }
-  for (const sessionId of Object.keys(state.sourceStatus)) {
-    if (!sources.has(sessionId)) delete state.sourceStatus[sessionId];
+  for (const statusKey of Object.keys(state.sourceStatus)) {
+    const split = statusKey.indexOf(':');
+    const sourceAgent = split >= 0 ? statusKey.slice(0, split) : 'codex';
+    const sessionId = split >= 0 ? statusKey.slice(split + 1) : statusKey;
+    if (sourceAgent === 'qoder' && !includeQoder) continue;
+    // Preserve the Qoder source marker while its canonical archive is inside
+    // the deletion grace period. Qoder does not expose deletion state through
+    // Codex's state database and its long boundary need not be a compaction.
+    if (sourceAgent === 'qoder' && fs.existsSync(canonicalArchivePath(sessionId))) continue;
+    if (!sources.has(sessionId)) delete state.sourceStatus[statusKey];
   }
 
   const immediateDeletes = [];
   const expiredDeletes = [];
   const pendingDeletes = [];
   for (const [sessionId, archive] of archivedSessionMap(archiveRoot)) {
+    if (!includeQoder && state.sourceStatus[`qoder:${sessionId}`]) {
+      delete state.missingSince[sessionId];
+      continue;
+    }
     const threadState = sessionId ? threadStates?.get(sessionId) : null;
+    const isKnownQoder = Boolean(state.sourceStatus[`qoder:${sessionId}`]);
     const archivedByFallback = !threadStates && sessionId && archivedSources.has(sessionId);
     if (threadState?.archived || archivedByFallback) {
       immediateDeletes.push({ sessionId, archive, reason: 'codex_thread_archived' });
       delete state.missingSince[sessionId];
       continue;
     }
-    const source = sources.get(sessionId);
+    const source = sources.get(sessionId)?.file;
     if (source && !longSources.has(sessionId)) {
       immediateDeletes.push({ sessionId, archive, reason: 'below_compaction_boundary' });
       delete state.missingSince[sessionId];
@@ -432,7 +479,7 @@ async function main() {
       delete state.missingSince[sessionId];
       continue;
     }
-    if (!(await crossedCompactionBoundary(archive))) {
+    if (!isKnownQoder && !(await crossedCompactionBoundary(archive))) {
       immediateDeletes.push({ sessionId, archive, reason: 'legacy_short_archive' });
       delete state.missingSince[sessionId];
       continue;
@@ -454,6 +501,7 @@ async function main() {
     runtimeDependency: 'none',
     remoteServerRequired: false,
     activeSourceSessions: activeSources.size,
+    qoderSourceSessions: qoderSources.size,
     archivedSourceSessions: archivedSources.size,
     codexStateDatabaseAvailable: threadStates !== null,
     compactedLongSessions: longSources.size,
@@ -473,6 +521,7 @@ async function main() {
     removeFile(item.archive, removed);
     pruneEmptyParents(item.archive, archiveRoot);
     delete state.missingSince[item.sessionId];
+    delete state.sourceStatus[`qoder:${item.sessionId}`];
   }
   const archiveRefresh = refreshArchives(longSources);
   const indexReport = runIndex();

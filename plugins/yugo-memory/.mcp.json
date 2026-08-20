@@ -11,7 +11,10 @@
         "XDG_CONFIG_HOME",
         "YUGO_MEMORY_HOME",
         "YUGO_MEMORY_ARCHIVE_DIR",
-        "YUGO_MEMORY_INDEX_DB"
+        "YUGO_MEMORY_INDEX_DB",
+        "YUGO_MEMORY_CONTROL_DB",
+        "YUGO_MEMORY_INCLUDE_QODER",
+        "YUGO_MEMORY_QODER_SOURCE_DIR"
       ]
     }
   }

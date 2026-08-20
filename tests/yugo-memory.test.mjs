@@ -75,6 +75,7 @@ test('stores only compacted sessions and applies lifecycle deletion policy', () 
     encoding: 'utf8',
     env: {
       ...process.env,
+      YUGO_MEMORY_INCLUDE_QODER: '0',
       CODEX_HOME: codexHome,
       YUGO_MEMORY_HOME: memoryRoot,
       YUGO_MEMORY_SKIP_INDEX: '1',
@@ -92,6 +93,73 @@ test('stores only compacted sessions and applies lifecycle deletion policy', () 
   assert.equal(fs.readFileSync(path.join(codexHome, 'sessions', longRel), 'utf8').includes('full original detail'), true);
 });
 
+test('shares a context-qualified Qoder long session through the canonical archive', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-qoder-'));
+  const codexHome = path.join(root, 'codex');
+  const qoderHome = path.join(root, 'qoder');
+  const memoryRoot = path.join(root, 'memory');
+  const sessionId = '88888888-8888-4888-8888-888888888888';
+  const source = path.join(qoderHome, 'projects', 'fictional', `${sessionId}.jsonl`);
+  writeJsonl(source, [
+    { type: 'runtime-config', sessionId, contextWindow: 4_000, model: 'fictional-model' },
+    { type: 'session_meta', sessionId, cwd: '/demo/fictional', data: {} },
+    { type: 'user', sessionId, message: { role: 'user', content: 'violet route '.repeat(1_200) } },
+    { type: 'assistant', sessionId, message: { role: 'assistant', content: 'fictional complete' } },
+  ]);
+  const result = spawnSync(process.execPath, [memoryScript], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      YUGO_MEMORY_INCLUDE_QODER: '1',
+      CODEX_HOME: codexHome,
+      QODER_HOME: qoderHome,
+      YUGO_MEMORY_HOME: memoryRoot,
+      YUGO_MEMORY_SKIP_INDEX: '1',
+      YUGO_MEMORY_QODER_LONG_RATIO: '0.05',
+      YUGO_MEMORY_QODER_MIN_TOKENS: '1000',
+      YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const canonical = canonicalArchive(memoryRoot, sessionId);
+  assert.equal(fs.existsSync(canonical), true);
+  assert.equal(fs.statSync(canonical).ino, fs.statSync(source).ino);
+  assert.match(result.stdout, /"qoderSourceSessions": 1/);
+
+  fs.unlinkSync(source);
+  const disabled = spawnSync(process.execPath, [memoryScript], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      QODER_HOME: qoderHome,
+      YUGO_MEMORY_HOME: memoryRoot,
+      YUGO_MEMORY_INCLUDE_QODER: '0',
+      YUGO_MEMORY_SKIP_INDEX: '1',
+      YUGO_MEMORY_DELETE_GRACE_DAYS: '0',
+      YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+    },
+  });
+  assert.equal(disabled.status, 0, disabled.stderr);
+  assert.equal(fs.existsSync(canonical), true);
+
+  const expired = spawnSync(process.execPath, [memoryScript], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      QODER_HOME: qoderHome,
+      YUGO_MEMORY_HOME: memoryRoot,
+      YUGO_MEMORY_INCLUDE_QODER: '1',
+      YUGO_MEMORY_SKIP_INDEX: '1',
+      YUGO_MEMORY_DELETE_GRACE_DAYS: '0',
+      YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+    },
+  });
+  assert.equal(expired.status, 0, expired.stderr);
+  assert.equal(fs.existsSync(canonical), false);
+});
+
 test('compact hook injects automatic recall context as valid JSON', () => {
   const result = spawnSync(process.execPath, [compactScript], {
     encoding: 'utf8',
@@ -100,10 +168,10 @@ test('compact hook injects automatic recall context as valid JSON', () => {
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.hookSpecificOutput.hookEventName, 'SessionStart');
-  assert.match(payload.hookSpecificOutput.additionalContext, /Yugo Memory recall tool/);
+  assert.match(payload.hookSpecificOutput.additionalContext, /Yugo Memory continuity/);
   assert.match(payload.hookSpecificOutput.additionalContext, /current_session_id=test-session/);
   assert.match(payload.hookSpecificOutput.additionalContext, /read_evidence/);
-  assert.match(payload.hookSpecificOutput.additionalContext, /standalone/);
+  assert.match(payload.hookSpecificOutput.additionalContext, /budgets output automatically/);
   assert.doesNotMatch(payload.hookSpecificOutput.additionalContext, /episodic-memory/i);
 });
 
@@ -122,6 +190,7 @@ test('imports compacted archives from prior local memory roots without an upstre
     encoding: 'utf8',
     env: {
       ...process.env,
+      YUGO_MEMORY_INCLUDE_QODER: '0',
       CODEX_HOME: path.join(root, 'codex'),
       XDG_CONFIG_HOME: configBase,
       YUGO_MEMORY_HOME: memoryRoot,
@@ -167,6 +236,7 @@ test('collapses growing legacy snapshots to one canonical session and relinks th
     encoding: 'utf8',
     env: {
       ...process.env,
+      YUGO_MEMORY_INCLUDE_QODER: '0',
       CODEX_HOME: codexHome,
       YUGO_MEMORY_HOME: memoryRoot,
       YUGO_MEMORY_SKIP_INDEX: '1',
@@ -202,6 +272,7 @@ test('canonical hard link preserves the seven-day deletion grace without duplica
   createStateDb(stateDb, [[sessionId, 0]]);
   const env = {
     ...process.env,
+    YUGO_MEMORY_INCLUDE_QODER: '0',
     CODEX_HOME: codexHome,
     YUGO_MEMORY_HOME: memoryRoot,
     YUGO_MEMORY_SKIP_INDEX: '1',

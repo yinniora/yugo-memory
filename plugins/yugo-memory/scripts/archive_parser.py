@@ -8,8 +8,10 @@ records used by the local recall index.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -101,6 +103,11 @@ class ParserState:
     project: str = ""
     cwd: str = ""
     git_branch: str = ""
+    source_agent: str = "codex"
+    context_window: int = 0
+    visible_chars: int = 0
+    visible_chars_since_compaction: int = 0
+    last_compaction_line: int = 0
     pending_line_start: int = 0
     pending_timestamp: str = ""
     pending_user: str = ""
@@ -330,6 +337,15 @@ def iter_bounded_lines(
 def _message_role_and_text(row: dict[str, Any]) -> tuple[str | None, str]:
     row_type = row.get("type")
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    # Qoder stores visible messages directly under a top-level `message`
+    # object. Keep the same normalized role/text contract as Codex.
+    if row_type == "user" and row.get("toolUseResult") is not None:
+        return None, ""
+    if row_type in {"user", "assistant"} and isinstance(row.get("message"), dict):
+        message = row["message"]
+        role = str(message.get("role") or row_type)
+        if role in {"user", "assistant"}:
+            return role, _text_fragments(message.get("content"))
     if row_type == "response_item" and payload.get("type") == "message":
         role = payload.get("role")
         if role in {"user", "assistant"}:
@@ -379,6 +395,18 @@ TOOL_LONG_FIELD_EDGE_CHARS = 4_000
 
 
 def _visible_tool_payload(row: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    # Qoder records tool results as user rows with `toolUseResult`, and
+    # streaming tool activity as `progress.data`. They are visible evidence,
+    # unlike hidden model reasoning.
+    if row.get("type") == "user" and row.get("toolUseResult") is not None:
+        payload = {
+            "toolUseResult": row.get("toolUseResult"),
+            "message": row.get("message"),
+        }
+        return payload, "qoder_tool_result", ""
+    if row.get("type") == "progress" and row.get("data") is not None:
+        payload = {"data": row.get("data"), "toolUseID": row.get("toolUseID")}
+        return payload, "qoder_progress", ""
     if row.get("type") != "response_item":
         return None, "", ""
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
@@ -546,29 +574,70 @@ def evidence_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
     ):
         return "compaction", _text_fragments(row.get("payload"), budget=40_000)
     if row.get("type") == "session_meta":
-        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
         metadata = {
-            key: payload.get(key) for key in ("id", "cwd", "project", "git_branch") if payload.get(key)
+            key: payload.get(key)
+            for key in ("id", "sessionId", "cwd", "project", "git_branch", "gitBranch")
+            if payload.get(key)
         }
         return "session", json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    if row.get("type") == "runtime-config":
+        metadata = {
+            "contextWindow": row.get("contextWindow"),
+            "model": row.get("model"),
+        }
+        return "runtime", json.dumps(
+            {key: value for key, value in metadata.items() if value is not None},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     return "", ""
 
 
 def _session_metadata(row: dict[str, Any], state: ParserState) -> None:
-    if row.get("type") != "session_meta":
+    row_type = row.get("type")
+    if row_type == "runtime-config":
+        try:
+            state.context_window = max(state.context_window, int(row.get("contextWindow") or 0))
+        except (TypeError, ValueError):
+            pass
+        state.source_agent = "qoder"
+        if not state.session_id:
+            state.session_id = str(row.get("sessionId") or "")
+        return
+    if row_type != "session_meta":
         return
     # Fork archives can contain the new fork's session_meta followed by the
     # source task's complete history, including its older session_meta. The
     # outer archive identity is the first record and must never be overwritten.
     if state.session_id:
         return
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-    state.session_id = str(payload.get("id") or state.session_id)
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
+    if "sessionId" in row and "payload" not in row:
+        state.source_agent = "qoder"
+    state.session_id = str(payload.get("id") or payload.get("sessionId") or state.session_id)
     state.forked_from_id = str(payload.get("forked_from_id") or state.forked_from_id)
     state.cwd = str(payload.get("cwd") or state.cwd)
     state.project = str(payload.get("project") or (Path(state.cwd).name if state.cwd else state.project))
     git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
-    state.git_branch = str(git.get("branch") or payload.get("git_branch") or state.git_branch)
+    state.git_branch = str(
+        git.get("branch") or payload.get("git_branch") or payload.get("gitBranch") or state.git_branch
+    )
+    try:
+        state.context_window = max(state.context_window, int(payload.get("context_window") or 0))
+    except (TypeError, ValueError):
+        pass
+
+
+def _record_visible_chars(state: ParserState, text: str) -> None:
+    amount = len(text or "")
+    state.visible_chars += amount
+    state.visible_chars_since_compaction += amount
+
+
+def _record_compaction(state: ParserState, line_number: int) -> None:
+    state.last_compaction_line = line_number
+    state.visible_chars_since_compaction = 0
 
 
 def _exchange_from_pending(path: Path, state: ParserState, line_end: int) -> Exchange | None:
@@ -627,6 +696,7 @@ def parse_increment(
                 oversized_role, oversized_text = oversized_evidence_text(line)
                 if b'"compacted"' in line.prefix or b'"context_compacted"' in line.prefix:
                     compactions.append((line.number, oversized_text))
+                    _record_compaction(state, line.number)
                 if oversized_role == "user":
                     cleaned, turn_kind = _clean_user_text(oversized_text)
                     if turn_kind != "meta":
@@ -639,11 +709,14 @@ def parse_increment(
                         state.pending_assistant = ""
                         state.pending_turn_kind = turn_kind
                         recent_canonical = ("user", cleaned)
+                        _record_visible_chars(state, cleaned)
                 elif oversized_role == "assistant" and state.pending_line_start:
                     state.pending_assistant = _bounded_append(state.pending_assistant, oversized_text)
                     recent_canonical = ("assistant", oversized_text)
+                    _record_visible_chars(state, oversized_text)
                 elif state.pending_line_start:
                     state.pending_assistant = _bounded_append(state.pending_assistant, oversized_text)
+                    _record_visible_chars(state, oversized_text)
                 continue
             try:
                 row = json.loads(line.raw)
@@ -669,9 +742,11 @@ def parse_increment(
                 state.pending_assistant = ""
                 state.pending_turn_kind = turn_kind
                 recent_canonical = ("user", text)
+                _record_visible_chars(state, text)
             elif role == "assistant" and state.pending_line_start:
                 state.pending_assistant = _bounded_append(state.pending_assistant, text)
                 recent_canonical = ("assistant", text)
+                _record_visible_chars(state, text)
             elif role == "user-fallback":
                 text, turn_kind = _clean_user_text(text)
                 if turn_kind == "meta":
@@ -686,15 +761,18 @@ def parse_increment(
                     state.pending_user = text
                     state.pending_assistant = ""
                     state.pending_turn_kind = turn_kind
+                    _record_visible_chars(state, text)
                 recent_canonical = None
             elif role == "assistant-fallback" and state.pending_line_start:
                 if recent_canonical != ("assistant", text):
                     state.pending_assistant = _bounded_append(state.pending_assistant, text)
+                    _record_visible_chars(state, text)
                 recent_canonical = None
             else:
                 tool_text = _tool_text(row)
                 if tool_text and state.pending_line_start:
                     state.pending_assistant = _bounded_append(state.pending_assistant, tool_text)
+                    _record_visible_chars(state, tool_text)
                 if row.get("type") == "compacted" or (
                     row.get("type") == "event_msg"
                     and isinstance(row.get("payload"), dict)
@@ -702,8 +780,61 @@ def parse_increment(
                 ):
                     summary = _text_fragments(row.get("payload"), budget=40_000)
                     compactions.append((line.number, summary))
+                    _record_compaction(state, line.number)
 
     pending = _exchange_from_pending(path, state, last_line)
     if pending:
         exchanges.append(pending)
     return exchanges, state, seek_points, compactions, max(0, state.next_byte_offset - start_offset)
+
+
+def probe_source(path: Path, long_ratio: float = 0.35, minimum_tokens: int = 16_000) -> dict[str, Any]:
+    """Classify a Codex/Qoder transcript without retaining its text."""
+
+    _exchanges, state, _seeks, compactions, scanned = parse_increment(path, ParserState())
+    estimated_tokens = math.ceil(state.visible_chars / 2.4)
+    if compactions:
+        long_enough = True
+        boundary = "compaction"
+    else:
+        dynamic_threshold = max(
+            minimum_tokens,
+            math.ceil(state.context_window * long_ratio) if state.context_window else minimum_tokens,
+        )
+        long_enough = estimated_tokens >= dynamic_threshold
+        boundary = "adaptive-context-ratio" if long_enough else "below-boundary"
+    return {
+        "session_id": state.session_id or path.stem,
+        "source_agent": state.source_agent,
+        "context_window": state.context_window or None,
+        "visible_chars": state.visible_chars,
+        "estimated_visible_tokens": estimated_tokens,
+        "long": long_enough,
+        "boundary": boundary,
+        "bytes_scanned": scanned,
+        "token_estimate_is_approximate": True,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    probe = sub.add_parser("probe")
+    probe.add_argument("--input", type=Path, required=True)
+    probe.add_argument("--long-ratio", type=float, default=0.35)
+    probe.add_argument("--minimum-tokens", type=int, default=16_000)
+    args = parser.parse_args()
+    if not 0.05 <= args.long_ratio <= 0.95:
+        raise SystemExit("--long-ratio must be between 0.05 and 0.95")
+    if args.minimum_tokens < 1_000:
+        raise SystemExit("--minimum-tokens must be at least 1000")
+    print(json.dumps(
+        probe_source(args.input, args.long_ratio, args.minimum_tokens),
+        ensure_ascii=False,
+        indent=2,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
