@@ -236,6 +236,17 @@ class ContinuityTests(unittest.TestCase):
         self.assertIsNone(task_status("session-end-a", control)["active_task"])
         self.assertIsNotNone(task_status("session-end-b", control)["active_task"])
 
+        nested = subprocess.run(
+            ["node", str(hook)],
+            input=json.dumps({"_meta": {"context": {"threadId": "session-end-b"}}}),
+            text=True,
+            capture_output=True,
+            env={**os.environ, "YUGO_MEMORY_HOME": str(memory_home)},
+            check=False,
+        )
+        self.assertEqual(nested.returncode, 0, nested.stderr)
+        self.assertIsNone(task_status("session-end-b", control)["active_task"])
+
 
 if __name__ == "__main__":
     unittest.main()

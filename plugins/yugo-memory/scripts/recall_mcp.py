@@ -19,17 +19,70 @@ from memory_control import (
 from recall_index import default_paths, index_status, read_evidence, search_index
 
 
-SERVER_VERSION = "1.4.1"
+SERVER_VERSION = "1.4.2"
+SESSION_ID_KEYS = (
+    "session_id", "sessionId", "thread_id", "threadId", "conversation_id", "conversationId",
+)
+SESSION_CONTAINER_KEYS = ("session", "thread", "conversation", "context", "client")
 
 
-def resolved_session_id(value: Any = None) -> str:
-    return str(
-        value
-        or os.environ.get("CODEX_THREAD_ID")
-        or os.environ.get("QODER_SESSION_ID")
-        or os.environ.get("YUGO_MEMORY_SESSION_ID")
-        or ""
-    )
+def _validated_session_id(value: Any, source: str) -> str | None:
+    if value is None or value == "":
+        return None
+    session_id = str(value).strip()
+    if not session_id:
+        return None
+    if len(session_id) > 256 or any(character.isspace() or ord(character) < 32 for character in session_id):
+        raise ValueError(f"invalid session id from {source}")
+    return session_id
+
+
+def _session_id_from_metadata(value: Any, depth: int = 0) -> str | None:
+    if not isinstance(value, dict) or depth > 2:
+        return None
+    for key in SESSION_ID_KEYS:
+        if key in value:
+            candidate = _validated_session_id(value.get(key), f"MCP metadata {key}")
+            if candidate:
+                return candidate
+    for key in SESSION_CONTAINER_KEYS:
+        candidate = _session_id_from_metadata(value.get(key), depth + 1)
+        if candidate:
+            return candidate
+    return None
+
+
+def resolved_session_id(
+    value: Any = None,
+    current_value: Any = None,
+    *metadata: Any,
+    required: bool = True,
+) -> str:
+    """Resolve a session without guessing another active task.
+
+    Explicit tool arguments win, then exact MCP metadata keys, then process
+    environment supplied by an agent host. There is intentionally no fallback to
+    the latest task, because that could leak constraints between conversations.
+    """
+
+    for source, candidate in (("session_id", value), ("current_session_id", current_value)):
+        resolved = _validated_session_id(candidate, source)
+        if resolved:
+            return resolved
+    for candidate in metadata:
+        resolved = _session_id_from_metadata(candidate)
+        if resolved:
+            return resolved
+    for key in ("CODEX_THREAD_ID", "QODER_SESSION_ID", "YUGO_MEMORY_SESSION_ID"):
+        resolved = _validated_session_id(os.environ.get(key), key)
+        if resolved:
+            return resolved
+    if required:
+        raise ValueError(
+            "session context unavailable; pass session_id/current_session_id from the current "
+            "SessionStart context (Yugo Memory will not guess another session)"
+        )
+    return ""
 
 
 def write_message(message: dict[str, Any]) -> None:
@@ -72,13 +125,15 @@ def tool_definitions() -> list[dict[str, Any]]:
             "name": "task_update",
             "description": (
                 "Update the ephemeral per-session task objective and optimized instruction checklist. "
-                "Auto mode detects a related follow-up versus a changed task. Complete, cancel, and clear "
-                "permanently remove the active checklist so stale instructions cannot leak into later work."
+                "Minimal auto mode is suitable for each substantive turn: acknowledgements do not mutate, "
+                "follow-ups amend, clearly independent tasks replace, and ambiguity preserves the current "
+                "objective. Complete, cancel, and clear permanently remove the checklist."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string", "minLength": 1},
+                    "current_session_id": {"type": "string"},
                     "action": {
                         "type": "string",
                         "enum": ["auto", "start", "replace", "amend", "complete", "cancel", "clear"],
@@ -109,6 +164,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "object"},
                     },
+                    "profile": {
+                        "type": "string", "enum": ["minimal", "compact", "standard"],
+                        "default": "minimal",
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -125,12 +184,14 @@ def tool_definitions() -> list[dict[str, Any]]:
             "name": "task_status",
             "description": (
                 "Read the compact active task objective and instruction checklist for one session. "
-                "The current Codex or Qoder session is used when session_id is omitted."
+                "Use session_id/current_session_id from the hook; exact MCP metadata or an agent-provided "
+                "session environment is used only when available, and another task is never guessed."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string", "minLength": 1},
+                    "current_session_id": {"type": "string"},
                     "profile": {"type": "string", "enum": ["minimal", "compact", "standard"], "default": "standard"},
                 },
                 "required": [],
@@ -312,16 +373,22 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         params = request.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
+        metadata = (params.get("_meta"), request.get("_meta"))
         _archive_root, target = default_paths()
         try:
             if name == "status":
                 value = index_status(target)
                 value["continuity"] = control_status()
             elif name == "prepare_context":
+                session_id = resolved_session_id(
+                    arguments.get("session_id"), arguments.get("current_session_id"), *metadata,
+                )
                 value = prepare_context(
-                    session_id=resolved_session_id(arguments.get("session_id")),
+                    session_id=session_id,
                     user_request=str(arguments.get("user_request") or ""),
-                    current_session_id=arguments.get("current_session_id"),
+                    current_session_id=resolved_session_id(
+                        arguments.get("current_session_id"), session_id, *metadata,
+                    ),
                     context_window=arguments.get("context_window"),
                     context_tokens_used=arguments.get("context_tokens_used"),
                     include_recall=str(arguments.get("include_recall", "auto")),
@@ -329,16 +396,21 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                 )
             elif name == "task_update":
                 value = sync_task(
-                    session_id=resolved_session_id(arguments.get("session_id")),
+                    session_id=resolved_session_id(
+                        arguments.get("session_id"), arguments.get("current_session_id"), *metadata,
+                    ),
                     user_request=str(arguments.get("user_request") or ""),
                     objective=str(arguments.get("objective") or ""),
                     items=arguments.get("items"),
                     action=str(arguments.get("action", "auto")),
                     source_refs=arguments.get("source_refs"),
+                    profile=str(arguments.get("profile", "minimal")),
                 )
             elif name == "task_status":
                 value = task_status(
-                    resolved_session_id(arguments.get("session_id")),
+                    resolved_session_id(
+                        arguments.get("session_id"), arguments.get("current_session_id"), *metadata,
+                    ),
                     profile=str(arguments.get("profile", "standard")),
                 )
             elif name == "experience_manage":
@@ -397,7 +469,9 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
                 else:
                     value = search_index(
                         target, query.strip(), limit=limit, mode=mode,
-                        current_session_id=arguments.get("current_session_id"),
+                        current_session_id=resolved_session_id(
+                            arguments.get("current_session_id"), None, *metadata, required=False,
+                        ) or None,
                         context_window=arguments.get("context_window"),
                         context_tokens_used=arguments.get("context_tokens_used"),
                         response_profile=arguments.get("response_profile", "auto"),

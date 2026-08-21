@@ -27,13 +27,40 @@ HISTORY_DEPENDENCY_RE = re.compile(
     re.IGNORECASE,
 )
 CONTINUITY_RE = re.compile(
-    r"^(?:继续|接着|然后|另外|补充|再|完成|修复|优化|更新|安装|发布)|"
-    r"^(?:continue|also|then|next|finish|fix|update|install|publish)\b",
+    r"^(?:继续|接着|然后|另外|此外|补充|再|还要|也要|同时|并且|其中|刚才|"
+    r"这个|这些|上述|前面|剩下|完成|修复|优化|更新|安装|发布)|"
+    r"^(?:continue|also|then|next|additionally|besides|finish|fix|update|install|publish)\b",
     re.IGNORECASE,
 )
 REPLACE_RE = re.compile(
     r"新任务|换个任务|改做|不要再做|停止当前|清除当前|重新开始|"
     r"new task|switch task|replace the task|stop the current",
+    re.IGNORECASE,
+)
+NOOP_RE = re.compile(
+    r"^(?:好|好的|明白|收到|谢谢|感谢|行|可以|没问题|继续|接着|继续吧|请继续|"
+    r"ok|okay|thanks|thank you|continue|go on)[。.!！\s]*$",
+    re.IGNORECASE,
+)
+STATUS_ONLY_RE = re.compile(
+    r"^(?:(?:现在|目前)?(?:进度|状态)(?:如何|怎么样|呢)?|(?:完成|结束)了吗|"
+    r"what(?:'s| is) the (?:current )?(?:status|progress)|status update)[？?。.!！\s]*$",
+    re.IGNORECASE,
+)
+ELLIPTICAL_FOLLOWUP_RE = re.compile(
+    r"(?:还要|也要|再加|补上|一并|与此同时|完成后|最后再|刚才|当前任务|上述|前面|剩下)|"
+    r"^(?:把|将)(?:输出|结果|报告|代码|测试|测试用例|文档|版本|它|这个|这些|上述|前面|剩下|当前)|"
+    r"(?:also|as well|in addition|the current task|the previous|the remaining)",
+    re.IGNORECASE,
+)
+SELF_CONTAINED_TASK_RE = re.compile(
+    r"^(?:请)?(?:设计|撰写|编写|创建|实现|开发|分析|总结|查询|调查|翻译|生成|写|制作)|"
+    r"^(?:please\s+)?(?:design|write|create|build|implement|develop|analy[sz]e|summari[sz]e|"
+    r"query|research|translate|generate)\b",
+    re.IGNORECASE,
+)
+CLEARLY_UNRELATED_RE = re.compile(
+    r"完全无关|与当前无关|另起一个|另开一个|unrelated|separate task|different task",
     re.IGNORECASE,
 )
 CONSTRAINT_RE = re.compile(
@@ -248,6 +275,64 @@ def _task_similarity(left: str, right: str) -> float:
     return cosine(embed(left), encode(right))
 
 
+def _task_lexical_overlap(left: str, right: str) -> float:
+    left_terms = set(extract_terms(left, max_terms=480))
+    right_terms = set(extract_terms(right, max_terms=160))
+    if not left_terms or not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / len(right_terms)
+
+
+def _current_task_text(current: sqlite3.Row) -> str:
+    items = json.loads(current["items_json"])
+    active = [str(item.get("text") or "") for item in items if item.get("status") == "active"]
+    return "\n".join((current["objective"], *active))
+
+
+def _auto_task_decision(
+    current: sqlite3.Row,
+    user_request: str,
+    proposed_objective: str,
+) -> dict[str, Any]:
+    """Classify one turn conservatively; uncertainty never mutates the ledger.
+
+    The deterministic local vector is a supporting signal only. It must never be
+    the sole reason to replace an active task, because short elliptical follow-ups
+    often share few surface features with the original objective.
+    """
+
+    request = normalize_text(user_request)
+    current_text = _current_task_text(current)
+    similarity = max(
+        _task_similarity(current["objective"], proposed_objective),
+        _task_similarity(current_text, proposed_objective),
+    )
+    lexical = _task_lexical_overlap(current_text, proposed_objective)
+    if REPLACE_RE.search(user_request):
+        decision, reason = "replace", "explicit_task_change"
+    elif NOOP_RE.fullmatch(request) or STATUS_ONLY_RE.fullmatch(request):
+        decision, reason = "unchanged", "non_mutating_turn"
+    elif CONTINUITY_RE.search(user_request.strip()) or ELLIPTICAL_FOLLOWUP_RE.search(user_request):
+        decision, reason = "amend", "explicit_or_elliptical_followup"
+    elif lexical >= 0.18 or similarity >= 0.30:
+        decision, reason = "amend", "related_content"
+    elif CLEARLY_UNRELATED_RE.search(user_request) or (
+        SELF_CONTAINED_TASK_RE.search(user_request.strip())
+        and lexical <= 0.08
+        and similarity < 0.14
+    ):
+        decision, reason = "replace", "independent_task"
+    else:
+        decision, reason = "ambiguous", "preserve_active_task"
+    return {
+        "decision": decision,
+        "reason": reason,
+        "objective_similarity": round(similarity, 4),
+        "lexical_overlap": round(lexical, 4),
+        "needs_disambiguation": decision == "ambiguous",
+    }
+
+
 def sync_task(
     session_id: str,
     user_request: str = "",
@@ -256,6 +341,7 @@ def sync_task(
     action: str = "auto",
     source_refs: list[dict[str, Any]] | None = None,
     control_path: Path | None = None,
+    profile: str = "standard",
 ) -> dict[str, Any]:
     if action not in {"auto", "start", "replace", "amend", "complete", "cancel", "clear"}:
         raise ValueError("unsupported task action")
@@ -275,7 +361,22 @@ def sync_task(
             "reason": action,
         }
 
-    proposed_items = _normalize_items(items, user_request or objective)
+    if profile not in {"minimal", "compact", "standard", "diagnostic"}:
+        db.close()
+        raise ValueError("profile must be minimal, compact, standard, or diagnostic")
+    request_text = user_request or objective
+    if action == "auto" and (NOOP_RE.fullmatch(normalize_text(request_text)) or STATUS_ONLY_RE.fullmatch(normalize_text(request_text))):
+        db.close()
+        return {
+            "transition": "unchanged",
+            "transition_reason": "non_mutating_turn",
+            "objective_similarity": None,
+            "lexical_overlap": None,
+            "needs_disambiguation": False,
+            "active_task": _task_payload(current, profile),
+        }
+
+    proposed_items = _normalize_items(items, request_text)
     proposed_objective = _optimized_objective(objective, proposed_items)
     if not proposed_objective:
         db.close()
@@ -283,12 +384,25 @@ def sync_task(
     should_replace = action in {"start", "replace"} or current is None
     reason = "explicit" if action in {"start", "replace", "amend"} else "auto"
     similarity = None
+    lexical_overlap = None
+    needs_disambiguation = False
     if current is not None and action == "auto":
-        similarity = _task_similarity(current["objective"], proposed_objective)
-        should_replace = bool(
-            REPLACE_RE.search(user_request)
-            or (not CONTINUITY_RE.search(user_request.strip()) and similarity < 0.14)
-        )
+        classification = _auto_task_decision(current, user_request, proposed_objective)
+        similarity = classification["objective_similarity"]
+        lexical_overlap = classification["lexical_overlap"]
+        reason = classification["reason"]
+        needs_disambiguation = classification["needs_disambiguation"]
+        if classification["decision"] in {"unchanged", "ambiguous"}:
+            db.close()
+            return {
+                "transition": classification["decision"],
+                "transition_reason": reason,
+                "objective_similarity": similarity,
+                "lexical_overlap": lexical_overlap,
+                "needs_disambiguation": needs_disambiguation,
+                "active_task": _task_payload(current, profile),
+            }
+        should_replace = classification["decision"] == "replace"
     if current is not None and action == "amend":
         should_replace = False
 
@@ -337,7 +451,9 @@ def sync_task(
         "transition": transition,
         "transition_reason": reason,
         "objective_similarity": round(similarity, 4) if similarity is not None else None,
-        "active_task": _task_payload(row),
+        "lexical_overlap": lexical_overlap,
+        "needs_disambiguation": needs_disambiguation,
+        "active_task": _task_payload(row, profile),
     }
 
 
@@ -518,13 +634,14 @@ def prepare_context(
     budget = adaptive_context_budget(
         target, current_session_id or session_id, context_window, context_tokens_used, "auto"
     )
+    profile = budget["profile"]
     task = sync_task(
         session_id=session_id,
         user_request=user_request,
         action="auto",
         control_path=control_path,
+        profile=profile,
     )
-    profile = budget["profile"]
     experience = recall_experiences(user_request, 3, control_path, profile)
     should_recall = include_recall == "yes" or (
         include_recall == "auto" and bool(HISTORY_DEPENDENCY_RE.search(user_request))
@@ -558,6 +675,8 @@ def prepare_context(
         "context_budget": budget,
         "active_task": active,
         "task_transition": task.get("transition"),
+        "task_transition_reason": task.get("transition_reason"),
+        "task_needs_disambiguation": task.get("needs_disambiguation", False),
         "experience_memory": experience,
         "conversation_recall": recall,
         "response_contract": {
@@ -573,7 +692,9 @@ def compact_hint(session_id: str, control_path: Path | None = None) -> str:
     base = (
         f"Yugo Memory continuity for session {session_id}; current_session_id={session_id}. "
         "Use prepare_context when hidden history or a "
-        "multi-step task matters; it budgets output automatically. Verify exact facts with read_evidence."
+        "multi-step task matters; it budgets output automatically. During an active multi-step task, "
+        "observe each substantive turn with task_update(action=auto, profile=minimal); acknowledgements "
+        "and status checks do not mutate it. Verify exact facts with read_evidence."
     )
     if not payload:
         return base

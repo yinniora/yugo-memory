@@ -4,7 +4,7 @@ Standalone, event-driven, full-fidelity long-conversation memory and task contin
 
 Codex conversations enter memory only after a real context-compaction event. Qoder conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
-Yugo Memory 1.4.1 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Yugo Memory 1.4.2 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
 
 ## Behavior
 
@@ -14,7 +14,8 @@ Yugo Memory 1.4.1 has no upstream memory runtime, remote server, API key, model 
 | `PostCompact` | One canonical hard link is refreshed and incrementally indexed |
 | `SessionStart(source=compact)` | Adds a bounded continuity hint and active task checklist |
 | Qoder transcript crosses its adaptive long boundary | Shares one canonical evidence link and index with Codex |
-| Long multi-step request | `prepare_context` updates the ephemeral task checklist and chooses a context-sized response |
+| Each substantive turn in an active multi-step task | A minimal local classifier keeps, amends, replaces, or conservatively preserves the task ledger without recalling history |
+| Long multi-step or hidden-history request | `prepare_context` updates continuity, chooses a context-sized response, and recalls only the needed memory layer |
 | Task changes or completes | Previous checklist is replaced or permanently cleared |
 | Verified reusable workflow succeeds | A versioned experience can be upserted with raw evidence locators |
 | Archived Codex task | Memory copy is permanently removed on the next lifecycle event |
@@ -35,7 +36,9 @@ Memory data lives under `~/.config/yugo-memory` by default. The repository rejec
 
 The estimate chooses an output budget; it is not presented as exact tokenizer accounting. `diagnostic` remains available for tests and troubleshooting.
 
-The active task database stores only a short derived objective and optimized instruction checklist. It does not copy the full raw prompt. Related follow-ups amend the checklist; an unrelated objective replaces it; `complete`, `cancel`, `clear`, and the Codex `SessionEnd` hook delete it. The checklist is injected after compaction to reduce task drift.
+The active task database stores only a short derived objective and optimized instruction checklist. It does not copy the full raw prompt. Each substantive turn can use `task_update(action=auto, profile=minimal)`, which is local and does not search conversation history. Explicit and elliptical follow-ups amend the checklist; explicit or clearly independent objectives replace it; acknowledgements and status checks do not mutate it; ambiguous requests preserve the existing objective without storing uncertain constraints. The deterministic local similarity score is supporting evidence, never the sole reason to replace a task.
+
+Session identity is fail-closed: explicit `session_id`/`current_session_id` wins, followed by exact MCP metadata and an agent-provided environment. Yugo Memory never falls back to the most recently active task, preventing cross-conversation constraint leakage. `complete`, `cancel`, `clear`, and the Codex `SessionEnd` hook delete the ledger. Qoder does not currently expose a reliable equivalent end hook in this adapter, so its agent must call `complete`, `cancel`, or `clear` when work reaches a terminal state; session-key isolation prevents an uncleared row from entering another conversation.
 
 Reusable experience is separate from the task ledger. Each experience has a stable key, version, situation, guidance, outcome, tags, and verified raw evidence locators. Updating creates a new active revision and supersedes the old one; deleting hard-deletes every revision. Experience text helps route future work but exact commands and claims still require `read_evidence`.
 

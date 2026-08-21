@@ -117,6 +117,7 @@ def install(repo: Path, qoder_home: Path) -> dict[str, Any]:
         "mcp": str(mcp_path),
         "skill": str(skill_target),
         "packages_installed": False,
+        "task_cleanup": "explicit complete/cancel/clear; no unsupported SessionEnd hook is assumed",
     }
 
 
@@ -158,6 +159,7 @@ def status(qoder_home: Path) -> dict[str, Any]:
         "hook_commands": len(commands),
         "skill_linked": skill.is_symlink(),
         "configured": "yugo-memory" in servers and bool(commands) and skill.is_symlink(),
+        "task_cleanup": "explicit complete/cancel/clear",
     }
 
 
