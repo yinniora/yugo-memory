@@ -175,6 +175,17 @@ test('compact hook injects automatic recall context as valid JSON', () => {
   assert.doesNotMatch(payload.hookSpecificOutput.additionalContext, /episodic-memory/i);
 });
 
+test('compact hook resolves exact nested thread metadata', () => {
+  const result = spawnSync(process.execPath, [compactScript], {
+    encoding: 'utf8',
+    input: JSON.stringify({ _meta: { context: { threadId: 'fictional-nested-thread' } } }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.hookSpecificOutput.additionalContext, /current_session_id=fictional-nested-thread/);
+  assert.match(payload.hookSpecificOutput.additionalContext, /task_update\(action=auto, profile=minimal\)/);
+});
+
 test('imports compacted archives from prior local memory roots without an upstream executable', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-migration-'));
   const configBase = path.join(root, 'config');
