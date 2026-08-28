@@ -1,7 +1,7 @@
 {
   "name": "yugo-memory",
-  "version": "1.4.2+codex.20260821091312",
-  "description": "Private cross-agent conversation recall, adaptive context budgeting, task continuity, and evidence-linked experience memory.",
+  "version": "1.5.0+codex.20260828130932",
+  "description": "Private cross-agent conversation recall, adaptive context budgeting, optional task checkpoints, and evidence-linked experience memory.",
   "author": {
     "name": "Yugo Memory contributors",
     "url": "https://github.com/yinniora"
@@ -24,8 +24,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Yugo Memory",
-    "shortDescription": "Keep long Codex and Qoder tasks aligned with exact, budgeted recall.",
-    "longDescription": "Shares one protected local memory across Codex and Qoder, keeps raw JSONL as the source of truth, adapts recall output to each task's context window, maintains an ephemeral instruction checklist, and stores versioned evidence-linked workflow experience. Exact-anchor lookup, multilingual FTS, local late interaction, LSH, graph routing, typed file/tool evidence, and bounded raw verification remain dependency-free.",
+    "shortDescription": "Keep long Codex and Qoder app tasks aligned with exact, budgeted recall.",
+    "longDescription": "Shares one protected local memory across Codex and Qoder app (not Qoder IDE), keeps raw JSONL as the source of truth, adapts recall output to each task's context window, optionally preserves only durable task constraints across compaction, and stores versioned evidence-linked workflow experience. Selective FTS, exact-anchor lookup, local late interaction, LSH, graph routing, typed file/tool evidence, and bounded raw verification remain dependency-free.",
     "developerName": "Yugo Memory contributors",
     "category": "Productivity",
     "capabilities": [

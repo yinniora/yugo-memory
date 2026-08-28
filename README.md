@@ -1,10 +1,12 @@
 # Yugo Memory
 
-Standalone, event-driven, full-fidelity long-conversation memory and task continuity for Codex and Qoder.
+Standalone, event-driven, full-fidelity long-conversation memory and task continuity for Codex and Qoder app.
 
-Codex conversations enter memory only after a real context-compaction event. Qoder conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
+Codex conversations enter memory only after a real context-compaction event. Qoder app conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
-Yugo Memory 1.4.2 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Here **Qoder app** means `/Applications/Qoder.app` with agent home `~/.qoder`. It is a different product from **Qoder IDE** (`/Applications/Qoder IDE.app`) and QoderWork. The included adapter deliberately modifies only `~/.qoder`; it neither installs into nor changes Qoder IDE or QoderWork.
+
+Yugo Memory 1.5.0 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
 
 ## Behavior
 
@@ -12,11 +14,12 @@ Yugo Memory 1.4.2 has no upstream memory runtime, remote server, API key, model 
 |---|---|
 | Codex conversation has not compacted | Not copied, summarized, or indexed |
 | `PostCompact` | One canonical hard link is refreshed and incrementally indexed |
-| `SessionStart(source=compact)` | Adds a bounded continuity hint and active task checklist |
-| Qoder transcript crosses its adaptive long boundary | Shares one canonical evidence link and index with Codex |
-| Each substantive turn in an active multi-step task | A minimal local classifier keeps, amends, replaces, or conservatively preserves the task ledger without recalling history |
-| Long multi-step or hidden-history request | `prepare_context` updates continuity, chooses a context-sized response, and recalls only the needed memory layer |
-| Task changes or completes | Previous checklist is replaced or permanently cleared |
+| `SessionStart(source=compact)` | Adds a bounded continuity hint and optional durable task checkpoint |
+| Qoder app transcript crosses its adaptive long boundary | Shares one canonical evidence link and index with Codex |
+| Ordinary visible-context turn | No task write and no recall; Codex owns current-task continuity |
+| Post-compaction or hidden-history request | Read-only `prepare_context` chooses a context-sized response and recalls only the needed memory layer |
+| Durable constraint, acceptance criterion, or blocker | An optional explicit checkpoint may be started or amended |
+| Task changes or completes | The optional checkpoint is explicitly replaced or permanently cleared |
 | Verified reusable workflow succeeds | A versioned experience can be upserted with raw evidence locators |
 | Archived Codex task | Memory copy is permanently removed on the next lifecycle event |
 | Deleted Codex task | Seven-day grace period; removal occurs on the first later lifecycle event after expiry |
@@ -26,7 +29,7 @@ Memory data lives under `~/.config/yugo-memory` by default. The repository rejec
 
 ## Adaptive continuity
 
-`prepare_context` is the normal entry point for long multi-step work. It reads the current agent's declared context window from Codex `session_meta` or Qoder `runtime-config`, estimates post-compaction usage from bounded visible text, and selects one of three response shapes:
+`prepare_context` is the read-only entry point after compaction or when hidden history matters. It reads the current agent's declared context window from Codex `session_meta` or Qoder `runtime-config`, estimates post-compaction usage from bounded visible text, and selects one of three response shapes:
 
 | Profile | When selected | Recall payload |
 |---|---|---|
@@ -36,9 +39,11 @@ Memory data lives under `~/.config/yugo-memory` by default. The repository rejec
 
 The estimate chooses an output budget; it is not presented as exact tokenizer accounting. `diagnostic` remains available for tests and troubleshooting.
 
-The active task database stores only a short derived objective and optimized instruction checklist. It does not copy the full raw prompt. Each substantive turn can use `task_update(action=auto, profile=minimal)`, which is local and does not search conversation history. Explicit and elliptical follow-ups amend the checklist; explicit or clearly independent objectives replace it; acknowledgements and status checks do not mutate it; ambiguous requests preserve the existing objective without storing uncertain constraints. The deterministic local similarity score is supporting evidence, never the sole reason to replace a task.
+The optional task database stores only an explicitly established objective plus durable constraints, acceptance criteria, and blockers. It does not copy the full prompt and `prepare_context` never mutates it. `task_update(action=auto)` cannot create or replace a checkpoint; it only adds durable clauses to an existing checkpoint. Ordinary follow-ups do not write. An explicit task-change phrase clears stale state, while `start` and `replace` remain deliberate operations. This removes similarity-based goal drift and avoids duplicating Codex's native current-context and compaction continuity.
 
-Session identity is fail-closed: explicit `session_id`/`current_session_id` wins, followed by exact MCP metadata and an agent-provided environment. Yugo Memory never falls back to the most recently active task, preventing cross-conversation constraint leakage. `complete`, `cancel`, `clear`, and the Codex `SessionEnd` hook delete the ledger. Qoder does not currently expose a reliable equivalent end hook in this adapter, so its agent must call `complete`, `cancel`, or `clear` when work reaches a terminal state; session-key isolation prevents an uncleared row from entering another conversation.
+Control schema v2 clears legacy v1 active-task rows once during migration because they were derived from the older every-turn policy and may be stale. Experience revisions are preserved.
+
+Session identity is fail-closed: explicit `session_id`/`current_session_id` wins, followed by exact MCP metadata and an agent-provided environment. Yugo Memory never falls back to the most recently active task, preventing cross-conversation constraint leakage. `complete`, `cancel`, `clear`, and the Codex `SessionEnd` hook delete the ledger. Qoder app does not currently expose a reliable equivalent end hook in this adapter, so its agent must call `complete`, `cancel`, or `clear` when work reaches a terminal state; session-key isolation prevents an uncleared row from entering another conversation.
 
 Reusable experience is separate from the task ledger. Each experience has a stable key, version, situation, guidance, outcome, tags, and verified raw evidence locators. Updating creates a new active revision and supersedes the old one; deleting hard-deletes every revision. Experience text helps route future work but exact commands and claims still require `read_evidence`.
 
@@ -66,7 +71,7 @@ The engine uses several complementary resolutions instead of one rigid hierarchy
 6. A sparse graph connects adjacent turns, chunks of one exchange, and exchanges sharing decisive identifiers.
 7. A calibrated evidence plan can combine up to four mutually supporting ranges from one task, while refusing unsupported cross-task assembly.
 
-Exact identifiers bypass approximate retrieval through a dedicated anchor index. When the same path, filename, or identifier occurs in multiple tasks, the complete query's contextual coverage reranks the expanded exact-candidate pool instead of trusting database order. `auto` mode combines FTS, local vectors, LSH, late interaction, and graph expansion; `deep` mode broadens the exchange-vector scan. The vectors are deterministic signed projections over multilingual terms, identifier pieces, character n-grams, and a small auditable equivalence map. They are not a neural embedding model and never leave the machine.
+Exact identifiers bypass approximate retrieval through a dedicated anchor index. Auto mode first tries a selective AND route over a few distributed identifiers and CJK trigrams; a supported hit bypasses the expensive broad cascade. Its fallback uses a bounded set of high-signal FTS terms before local vectors, LSH, late interaction, and graph expansion. `deep` mode keeps the full cascade for difficult queries. The vectors are deterministic signed projections over multilingual terms, identifier pieces, character n-grams, and a small auditable equivalence map. They are not a neural embedding model and never leave the machine.
 
 The design adapts proven retrieval ideas to a private, dependency-free runtime: multi-vector MaxSim follows the late-interaction principle; session and compaction-epoch routing provide multi-resolution navigation; sparse graph expansion supports linked facts. Summaries, vectors, and graph edges never count as evidence. Only verified raw transcript ranges do.
 
@@ -88,7 +93,7 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 
 ## Canonical storage and incremental indexing
 
-- Codex or Qoder owns the original transcript. Yugo Memory never keeps multiple growing snapshots of one session.
+- Codex or Qoder app owns the original transcript. Yugo Memory never keeps multiple growing snapshots of one session.
 - Every long session resolves to one canonical evidence path keyed by `session_id`.
 - Active long sessions are hard-linked when possible, so the evidence path consumes no additional data blocks on the same filesystem. A private atomic copy is used only when hard links are unavailable.
 - Existing legacy/current snapshots are grouped by `session_id`, the most complete candidate is retained, and redundant versions are removed before indexing.
@@ -100,7 +105,7 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 - Opaque base64/data-URL/hex payloads remain available in raw evidence but are replaced by typed, bounded attachment descriptors in navigation records, preventing images and binary tool output from inflating the index.
 - Codex compaction summaries improve routing but never replace raw evidence.
 - A one-time legacy import can recover the most complete compacted evidence from prior local memory roots. It is immediately canonicalized; no legacy executable, database, MCP, or vector service is called.
-- SQLite schema v13 uses `WITHOUT ROWID` for key-heavy retrieval tables, incremental auto-vacuum, optimizer statistics, all-file descriptors, and independent visible-tool evidence nodes while safely rebuilding older navigation records.
+- SQLite schema v13 uses `WITHOUT ROWID` for key-heavy retrieval tables, incremental auto-vacuum, optimizer statistics, all-file descriptors, and independent visible-tool evidence nodes while safely rebuilding older navigation records. Event-driven maintenance also attempts a bounded WAL checkpoint after each completed sync.
 
 ## Install
 
@@ -118,13 +123,13 @@ The installer only enables Codex plugin hooks, registers this checkout as a loca
 
 Do not run Yugo Memory and `codex-long-memory` at the same time. If the legacy plugin is still registered, the installer stops before changing Codex settings and asks you to remove it explicitly. Legacy archives may remain where they are: Yugo Memory imports supported prior archives once, without executing prior code or opening prior indexes.
 
-Qoder uses the same protected memory root and runtime. Its separate adapter links the skill and adds only the Yugo Memory MCP and event hooks to existing Qoder JSON configuration; it does not install packages or replace unrelated settings:
+Qoder app uses the same protected memory root and runtime. Its separate adapter links the skill and adds only the Yugo Memory MCP and event hooks to existing `~/.qoder` JSON configuration; it does not install packages or replace unrelated settings. This command does not configure Qoder IDE or QoderWork:
 
 ```bash
 bash install-qoder.sh
 ```
 
-Run this only after reviewing and approving those Qoder configuration changes. Restart Qoder afterward.
+Run this only after reviewing and approving those Qoder app configuration changes. Restart Qoder app afterward.
 
 ## Verify
 
@@ -154,7 +159,7 @@ Start a new Codex task after updating. If hooks changed, review and trust their 
 | `YUGO_MEMORY_DELETE_GRACE_DAYS` | `7` |
 | `YUGO_MEMORY_SOURCE_DIR` | `$CODEX_HOME/sessions` |
 | `YUGO_MEMORY_ARCHIVED_SOURCE_DIR` | `$CODEX_HOME/archived_sessions` |
-| `QODER_HOME` | `~/.qoder` |
+| `QODER_HOME` | `~/.qoder` (Qoder app only; not Qoder IDE/QoderWork) |
 | `YUGO_MEMORY_QODER_SOURCE_DIR` | `$QODER_HOME/projects` |
 | `YUGO_MEMORY_INCLUDE_QODER` | `1`; set `0` to disable Qoder discovery |
 | `YUGO_MEMORY_QODER_LONG_RATIO` | `0.35` of the declared context window |
@@ -164,7 +169,7 @@ Start a new Codex task after updating. If hooks changed, review and trust their 
 | `YUGO_MEMORY_CONTROL_DB` | `$YUGO_MEMORY_HOME/control.sqlite` |
 | `YUGO_MEMORY_LEGACY_ARCHIVE_DIR` | Optional single migration root; otherwise both supported prior local roots are checked once |
 
-The plugin recognizes Codex `type=compacted` and `event_msg/context_compacted`, plus Qoder's `runtime-config`, `session_meta`, visible messages, progress, and tool-result rows. Transcript formats are unstable interfaces, so compatibility is covered by synthetic fixtures and should be retested after agent updates.
+The plugin recognizes Codex `type=compacted` and `event_msg/context_compacted`, plus Qoder app's `runtime-config`, `session_meta`, visible messages, progress, and tool-result rows. Transcript formats are unstable interfaces, so compatibility is covered by synthetic fixtures and should be retested after agent updates.
 
 ## Privacy and deletion
 

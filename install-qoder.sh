@@ -10,6 +10,6 @@ for command_name in node python3; do
   fi
 done
 
-echo "Configuring Qoder to use the existing dependency-free Yugo Memory runtime..."
+echo "Configuring Qoder app (~/.qoder), not Qoder IDE or QoderWork, to use Yugo Memory..."
 python3 "$repo_root/scripts/qoder-adapter.py" install --repo "$repo_root"
-echo "Restart Qoder, then verify that the yugo-memory MCP and skill are available."
+echo "Restart Qoder app, then verify that the yugo-memory MCP and skill are available."

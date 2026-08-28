@@ -123,9 +123,10 @@ class ContinuityTests(unittest.TestCase):
         self.assertTrue(recalled["safe_to_answer"])
         self.assertEqual(recalled["results"][0]["session_id"], "qoder-fictional")
 
-    def test_task_auto_replaces_unrelated_objective_and_clears_on_completion(self) -> None:
+    def test_task_checkpoint_is_explicit_and_clears_on_task_change(self) -> None:
         first = sync_task(
             "session-a", "实现虚构彗星索引，必须保持本地运行，并验证测试通过。",
+            action="start",
             control_path=self.control,
         )
         self.assertEqual(first["transition"], "started")
@@ -133,12 +134,10 @@ class ContinuityTests(unittest.TestCase):
             "session-a", "另外补充失败时不能编造结果。", control_path=self.control,
         )
         self.assertEqual(amended["transition"], "amended")
-        replaced = sync_task(
+        changed = sync_task(
             "session-a", "新任务：设计虚构温室灌溉表。", control_path=self.control,
         )
-        self.assertEqual(replaced["transition"], "replaced")
-        cleared = sync_task("session-a", action="complete", control_path=self.control)
-        self.assertTrue(cleared["cleared"])
+        self.assertEqual(changed["transition"], "cleared")
         self.assertIsNone(task_status("session-a", self.control)["active_task"])
 
     def test_experience_is_versioned_recalled_and_hard_deleted(self) -> None:
@@ -174,7 +173,8 @@ class ContinuityTests(unittest.TestCase):
             control_path=self.control, index_path=self.index,
         )
         self.assertIsNone(payload["conversation_recall"])
-        self.assertIsNotNone(payload["active_task"])
+        self.assertIsNone(payload["active_task"])
+        self.assertEqual(payload["task_transition"], "read")
 
     def test_prepare_context_reports_unready_index_without_building_it(self) -> None:
         payload = prepare_context(
@@ -202,7 +202,10 @@ class ContinuityTests(unittest.TestCase):
             sys.executable, str(adapter), "install", "--repo", str(ROOT),
             "--qoder-home", str(qoder_home),
         ], text=True, capture_output=True, check=True)
-        self.assertTrue(json.loads(installed.stdout)["installed"])
+        installed_payload = json.loads(installed.stdout)
+        self.assertTrue(installed_payload["installed"])
+        self.assertEqual(installed_payload["target_product"], "Qoder app")
+        self.assertFalse(installed_payload["qoder_ide_modified"])
         status = subprocess.run([
             sys.executable, str(adapter), "status", "--repo", str(ROOT),
             "--qoder-home", str(qoder_home),
@@ -218,11 +221,36 @@ class ContinuityTests(unittest.TestCase):
         self.assertIn("fictional-existing", servers)
         self.assertNotIn("yugo-memory", servers)
 
+    def test_qoder_adapter_rejects_known_non_app_homes(self) -> None:
+        adapter = ROOT / "scripts/qoder-adapter.py"
+        for home_name in (".qoderwork", ".qoder-cli", ".qoder-cn"):
+            target = self.root / home_name
+            run = subprocess.run([
+                sys.executable, str(adapter), "install", "--repo", str(ROOT),
+                "--qoder-home", str(target),
+            ], text=True, capture_output=True, check=False)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("refusing non-Qoder-app home", run.stderr)
+
+    def test_qoder_adapter_rejects_wrong_product_marker(self) -> None:
+        qoder_home = self.root / "custom-qoder-home"
+        qoder_home.mkdir()
+        (qoder_home / ".qoder-app-status.json").write_text(json.dumps({
+            "product": "fictional-other-product",
+        }), encoding="utf-8")
+        adapter = ROOT / "scripts/qoder-adapter.py"
+        run = subprocess.run([
+            sys.executable, str(adapter), "status", "--repo", str(ROOT),
+            "--qoder-home", str(qoder_home),
+        ], text=True, capture_output=True, check=False)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("expected Qoder app product='qoder'", run.stderr)
+
     def test_session_end_hook_clears_only_that_task(self) -> None:
         memory_home = self.root / "memory-home"
         control = memory_home / "control.sqlite"
-        sync_task("session-end-a", "完成虚构索引。", control_path=control)
-        sync_task("session-end-b", "完成虚构报告。", control_path=control)
+        sync_task("session-end-a", "完成虚构索引。", action="start", control_path=control)
+        sync_task("session-end-b", "完成虚构报告。", action="start", control_path=control)
         hook = SCRIPTS / "task-lifecycle.mjs"
         run = subprocess.run(
             ["node", str(hook)],
@@ -246,6 +274,36 @@ class ContinuityTests(unittest.TestCase):
         )
         self.assertEqual(nested.returncode, 0, nested.stderr)
         self.assertIsNone(task_status("session-end-b", control)["active_task"])
+
+        sync_task("session-end-c", "完成虚构轨道表。", action="start", control_path=control)
+        deep = subprocess.run(
+            ["node", str(hook)],
+            input=json.dumps({"hook": {"payload": {"data": [{"details": {
+                "conversationId": "session-end-c",
+            }}]}}}),
+            text=True,
+            capture_output=True,
+            env={**os.environ, "YUGO_MEMORY_HOME": str(memory_home)},
+            check=False,
+        )
+        self.assertEqual(deep.returncode, 0, deep.stderr)
+        self.assertIsNone(task_status("session-end-c", control)["active_task"])
+
+        sync_task("session-end-d", "完成虚构极光表。", action="start", control_path=control)
+        from_env = subprocess.run(
+            ["node", str(hook)],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "YUGO_MEMORY_HOME": str(memory_home),
+                "CODEX_THREAD_ID": "session-end-d",
+            },
+            check=False,
+        )
+        self.assertEqual(from_env.returncode, 0, from_env.stderr)
+        self.assertIsNone(task_status("session-end-d", control)["active_task"])
 
 
 if __name__ == "__main__":

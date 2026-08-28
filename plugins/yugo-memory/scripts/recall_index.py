@@ -765,6 +765,10 @@ def sync_index(archive_root: Path, index_path: Path, force: bool = False) -> dic
     if removed:
         db.execute("PRAGMA incremental_vacuum")
     db.execute("PRAGMA optimize")
+    # Keep completed maintenance from leaving hundreds of MiB in the WAL. A
+    # live reader wins after 250 ms; the next event-driven sync can retry.
+    db.execute("PRAGMA busy_timeout=250")
+    checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     counts = {
         row["level"]: row["count"]
         for row in db.execute("SELECT level, count(*) AS count FROM nodes GROUP BY level")
@@ -786,6 +790,8 @@ def sync_index(archive_root: Path, index_path: Path, force: bool = False) -> dic
         "graph_edges": edge_count,
         "index_bytes": page_size * page_count,
         "reclaimable_bytes": page_size * freelist_count,
+        "wal_checkpoint_busy": int(checkpoint[0]) if checkpoint else 0,
+        "wal_checkpoint_pages": int(checkpoint[1]) if checkpoint else 0,
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         "archive_root": str(archive_root),
         "index_path": str(index_path),
@@ -800,11 +806,99 @@ rebuild_index = sync_index
 
 def _fts_expression(features: QueryFeatures) -> str:
     safe = []
-    for term in dict.fromkeys((*features.anchors, *features.terms)):
+    for term in _selective_query_terms(features):
         cleaned = term.replace('"', '""').strip()
         if cleaned:
             safe.append(f'"{cleaned}"')
-    return " OR ".join(safe[:96])
+    return " OR ".join(safe)
+
+
+def _spread(values: list[str], limit: int) -> list[str]:
+    if len(values) <= limit:
+        return values
+    if limit <= 1:
+        return values[:limit]
+    indexes = [round(index * (len(values) - 1) / (limit - 1)) for index in range(limit)]
+    return [values[index] for index in dict.fromkeys(indexes)]
+
+
+def _selective_query_terms(features: QueryFeatures, limit: int = 12) -> tuple[str, ...]:
+    """Keep a small, distributed set of useful FTS terms.
+
+    Huge OR expressions over overlapping CJK n-grams dominate recall latency.
+    Exact identifiers, Latin/code terms, and spread-out trigrams keep the same
+    evidence route while avoiding broad posting-list unions.
+    """
+
+    ordered = list(dict.fromkeys((*features.anchors, *features.terms)))
+    structured = [
+        term for term in ordered
+        if re.search(r"[./_:@#-]|\d", term) and not term.isdigit()
+    ]
+    latin = [
+        term for term in ordered
+        if term.isascii() and len(term) >= 4 and term not in structured
+    ]
+    cjk3 = [term for term in ordered if len(term) >= 3 and not term.isascii()]
+    cjk2 = [term for term in ordered if len(term) == 2 and not term.isascii()]
+    selected = [
+        *_spread(structured, 4),
+        *_spread(latin, 4),
+        *_spread(cjk3, 6),
+    ]
+    if not selected:
+        selected = _spread(cjk2 or ordered, limit)
+    result: list[str] = []
+    for term in selected:
+        if any(term != kept and term in kept and re.search(r"[./_:@#-]", kept) for kept in result):
+            continue
+        if term not in result:
+            result.append(term)
+        if len(result) >= limit:
+            break
+    return tuple(result)
+
+
+def _strict_fts_expression(features: QueryFeatures) -> tuple[str, tuple[str, ...]]:
+    candidates = list(_selective_query_terms(features, limit=10))
+    stable = [
+        term for term in candidates
+        if re.search(r"[./_:@#-]|\d", term) or (term.isascii() and len(term) >= 4)
+    ]
+    cjk = [term for term in candidates if not term.isascii() and len(term) >= 3]
+    pivots = [*_spread(stable, 3), *_spread(cjk, 3)]
+    pivots = list(dict.fromkeys(pivots))[:3]
+    if len(pivots) < 2 and not any(re.search(r"[./_:@#-]|\d", term) for term in pivots):
+        return "", ()
+    safe = [f'"{term.replace(chr(34), chr(34) * 2)}"' for term in pivots]
+    return " AND ".join(safe), tuple(pivots)
+
+
+def _strict_ranked_nodes(
+    db: sqlite3.Connection,
+    features: QueryFeatures,
+    limit: int,
+) -> tuple[list[sqlite3.Row], tuple[str, ...], bool]:
+    expression, pivots = _strict_fts_expression(features)
+    query = (
+        """SELECT n.*, bm25(nodes_fts, 0.0, 2.3) AS lexical_rank
+             FROM nodes_fts JOIN nodes n ON n.id=nodes_fts.node_id
+            WHERE nodes_fts MATCH ? AND n.level='exchange'
+            ORDER BY lexical_rank, n.timestamp DESC LIMIT ?"""
+    )
+    if expression:
+        rows = db.execute(query, (expression, limit)).fetchall()
+        if rows:
+            return rows, pivots, False
+    identifier = next((
+        term for term in _selective_query_terms(features, limit=10)
+        if term.isascii() and len(term) >= 5 and re.search(r"[._:#-]|\d", term)
+    ), "")
+    if not identifier:
+        return [], pivots, False
+    escaped = identifier.replace('"', '""')
+    rows = db.execute(query, (f'"{escaped}"', limit)).fetchall()
+    return rows, (identifier,), not rows
 
 
 def _ranked_nodes(
@@ -905,13 +999,21 @@ def _lsh_nodes(
 ) -> list[sqlite3.Row]:
     bands = lsh_bands(query_vector)
     placeholders = ",".join("?" for _ in bands)
-    return db.execute(
-        f"""SELECT n.*, count(DISTINCT l.band) AS band_matches
-              FROM node_lsh l JOIN nodes n ON n.id=l.node_id
-             WHERE l.band IN ({placeholders}) AND n.level='exchange'
-             GROUP BY n.id ORDER BY band_matches DESC, n.timestamp DESC LIMIT ?""",
+    hits = db.execute(
+        f"""SELECT node_id, count(DISTINCT band) AS band_matches
+              FROM node_lsh WHERE band IN ({placeholders})
+             GROUP BY node_id ORDER BY band_matches DESC LIMIT ?""",
         (*bands, limit),
     ).fetchall()
+    if not hits:
+        return []
+    node_ids = [row["node_id"] for row in hits]
+    rows = db.execute(
+        f"SELECT * FROM nodes WHERE id IN ({','.join('?' for _ in node_ids)})",
+        node_ids,
+    ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    return [by_id[node_id] for node_id in node_ids if node_id in by_id]
 
 
 def _late_interaction_rows(
@@ -1313,11 +1415,33 @@ def search_index(
         and len(direct_stable_anchors) == len(features.decisive_anchors)
     )
     direct_only = bool(exact_anchor_rows and features.decisive_anchors and features.ordinal_index is None)
-    if direct_only or direct_absent:
+
+    stage = time.perf_counter()
+    strict_rows: list[sqlite3.Row] = []
+    strict_pivots: tuple[str, ...] = ()
+    strict_identifier_absent = False
+    if (
+        not direct_only
+        and not direct_absent
+        and features.ordinal_index is None
+        and len(features.decisive_anchors) <= 1
+    ):
+        strict_rows, strict_pivots, strict_identifier_absent = _strict_ranked_nodes(
+            db, features, max(64, limit * 10),
+        )
+    strict_bypass = bool(strict_rows and mode != "deep")
+    for rank, row in enumerate(strict_rows, 1):
+        _add_route(scores, row, "strict-lexical", rank, 3.2)
+        scores[row["id"]]["score"] += 0.18 * evidence_coverage(row["terms"], features)[2]
+        if row["id"].startswith("exchange:tool:"):
+            scores[row["id"]]["score"] += 0.12
+            scores[row["id"]]["routes"].append("tool-evidence")
+    timings["strict_lexical_ms"] = (time.perf_counter() - stage) * 1000
+    if direct_only or direct_absent or strict_identifier_absent or strict_bypass:
         use_vector = False
 
     stage = time.perf_counter()
-    session_rows = [] if direct_only or direct_absent else _ranked_nodes(db, features, "session", 16)
+    session_rows = [] if direct_only or direct_absent or strict_identifier_absent or strict_bypass else _ranked_nodes(db, features, "session", 16)
     dense_sessions = _dense_nodes(db, query_vector, "session", 12) if use_vector else []
     session_route_scores: defaultdict[str, float] = defaultdict(float)
     for rank, row in enumerate(session_rows, 1):
@@ -1331,7 +1455,7 @@ def search_index(
     timings["session_route_ms"] = (time.perf_counter() - stage) * 1000
 
     stage = time.perf_counter()
-    episode_rows = [] if direct_only or direct_absent or features.ordinal_index is not None else _ranked_nodes(
+    episode_rows = [] if direct_only or direct_absent or strict_identifier_absent or strict_bypass or features.ordinal_index is not None else _ranked_nodes(
         db, features, "episode", 32, route_sessions or None,
     )
     dense_episodes = (
@@ -1348,8 +1472,10 @@ def search_index(
     timings["episode_route_ms"] = (time.perf_counter() - stage) * 1000
 
     stage = time.perf_counter()
-    exchange_rows = [] if direct_only or direct_absent or features.ordinal_index is not None else _ranked_nodes(
-        db, features, "exchange", max(64, limit * 10), include_text=True,
+    exchange_rows = (
+        strict_rows if strict_bypass
+        else [] if direct_only or direct_absent or strict_identifier_absent or features.ordinal_index is not None
+        else _ranked_nodes(db, features, "exchange", max(64, limit * 10), include_text=True)
     )
     for rank, row in enumerate(exchange_rows, 1):
         if row["session_id"] in session_ranks:
@@ -1395,8 +1521,21 @@ def search_index(
         scores[row["id"]]["score"] += 0.12 * evidence_coverage(row["terms"], features)[2]
     timings["sparse_evidence_ms"] = (time.perf_counter() - stage) * 1000
 
+    best_sparse_coverage = max(
+        (evidence_coverage(entry["row"]["terms"], features)[2] for entry in scores.values()),
+        default=0.0,
+    )
+    bounded_sparse_bypass = bool(
+        mode == "auto" and len(scores) >= 24 and best_sparse_coverage >= 0.25
+    )
+
     stage = time.perf_counter()
-    if use_vector and features.ordinal_index is None:
+    if (
+        use_vector
+        and mode == "deep"
+        and not bounded_sparse_bypass
+        and features.ordinal_index is None
+    ):
         dense_scope = None if mode == "deep" else (route_sessions or None)
         dense_ranges = None
         if mode == "auto":
@@ -1419,7 +1558,9 @@ def search_index(
 
     stage = time.perf_counter()
     if use_vector and features.ordinal_index is None:
-        lsh_rows = _lsh_nodes(db, query_vector, max(96, limit * 16))
+        lsh_rows = [] if bounded_sparse_bypass else _lsh_nodes(
+            db, query_vector, max(96, limit * 16),
+        )
         candidate_ids = list(dict.fromkeys(
             [entry["row"]["id"] for entry in sorted(
                 scores.values(), key=lambda entry: entry["score"], reverse=True,
@@ -1625,6 +1766,10 @@ def search_index(
         "local_vector_used": use_vector,
         "direct_anchor_bypass": direct_only,
         "direct_anchor_absence_bypass": direct_absent,
+        "strict_lexical_bypass": strict_bypass,
+        "strict_identifier_absence_bypass": strict_identifier_absent,
+        "strict_lexical_pivots": list(strict_pivots),
+        "bounded_sparse_vector_bypass": bounded_sparse_bypass,
         "query_features": {
             "terms": list(features.terms),
             "anchors": list(features.anchors),

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Install or remove the dependency-free Yugo Memory adapter for Qoder."""
+"""Install or remove the dependency-free Yugo Memory adapter for Qoder app.
+
+This adapter targets Qoder app's ``~/.qoder`` agent home. It does not modify
+Qoder IDE, QoderWork, or their application-support directories.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,11 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+TARGET_PRODUCT = "Qoder app"
+DEFAULT_QODER_HOME = Path.home() / ".qoder"
+NON_TARGET_HOME_NAMES = {".qoderwork", ".qoder-cli", ".qoder-cn"}
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -32,6 +41,24 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
         os.replace(temp, path)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def validate_qoder_app_home(qoder_home: Path) -> None:
+    """Fail closed when a known non-Qoder-app home is selected."""
+    if qoder_home.name.lower() in NON_TARGET_HOME_NAMES:
+        raise ValueError(
+            f"refusing non-Qoder-app home: {qoder_home}; "
+            f"this adapter targets {DEFAULT_QODER_HOME} and never configures Qoder IDE or QoderWork"
+        )
+    status_path = qoder_home / ".qoder-app-status.json"
+    if not status_path.is_file():
+        return
+    status = load_json(status_path, {})
+    product = str(status.get("product") or "").strip().lower()
+    if product and product != "qoder":
+        raise ValueError(
+            f"refusing product={product!r} at {qoder_home}; expected Qoder app product='qoder'"
+        )
 
 
 def hook_group(command: str, matcher: str | None = None, timeout: int = 10) -> dict[str, Any]:
@@ -64,6 +91,7 @@ def remove_yugo_hooks(settings: dict[str, Any]) -> None:
 
 
 def install(repo: Path, qoder_home: Path) -> dict[str, Any]:
+    validate_qoder_app_home(qoder_home)
     runtime = repo / "plugins/yugo-memory/scripts/yugo-memory.mjs"
     context = repo / "plugins/yugo-memory/scripts/compact-recall-context.mjs"
     mcp = repo / "plugins/yugo-memory/scripts/recall_mcp.py"
@@ -109,7 +137,10 @@ def install(repo: Path, qoder_home: Path) -> dict[str, Any]:
     atomic_json(mcp_path, mcp_json)
     return {
         "installed": True,
+        "target_product": TARGET_PRODUCT,
         "qoder_home": str(qoder_home),
+        "qoder_ide_modified": False,
+        "qoderwork_modified": False,
         "shared_memory_home": os.environ.get(
             "YUGO_MEMORY_HOME", str(Path.home() / ".config/yugo-memory")
         ),
@@ -122,6 +153,7 @@ def install(repo: Path, qoder_home: Path) -> dict[str, Any]:
 
 
 def uninstall(qoder_home: Path) -> dict[str, Any]:
+    validate_qoder_app_home(qoder_home)
     settings_path = qoder_home / "settings.json"
     mcp_path = qoder_home / "mcp.json"
     settings = load_json(settings_path, {})
@@ -136,12 +168,16 @@ def uninstall(qoder_home: Path) -> dict[str, Any]:
     atomic_json(mcp_path, mcp_json)
     return {
         "installed": False,
+        "target_product": TARGET_PRODUCT,
         "qoder_home": str(qoder_home),
+        "qoder_ide_modified": False,
+        "qoderwork_modified": False,
         "memory_preserved": True,
     }
 
 
 def status(qoder_home: Path) -> dict[str, Any]:
+    validate_qoder_app_home(qoder_home)
     settings = load_json(qoder_home / "settings.json", {})
     mcp_json = load_json(qoder_home / "mcp.json", {"mcpServers": {}})
     commands = []
@@ -154,7 +190,10 @@ def status(qoder_home: Path) -> dict[str, Any]:
     skill = qoder_home / "skills/yugo-memory-auto-recall"
     servers = mcp_json.get("mcpServers") if isinstance(mcp_json.get("mcpServers"), dict) else {}
     return {
+        "target_product": TARGET_PRODUCT,
         "qoder_home": str(qoder_home),
+        "qoder_ide_modified": False,
+        "qoderwork_modified": False,
         "mcp_configured": "yugo-memory" in servers,
         "hook_commands": len(commands),
         "skill_linked": skill.is_symlink(),
@@ -167,7 +206,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("install", "uninstall", "status"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--qoder-home", type=Path, default=Path.home() / ".qoder")
+    parser.add_argument(
+        "--qoder-home", type=Path, default=DEFAULT_QODER_HOME,
+        help="Qoder app agent home (default: ~/.qoder); not Qoder IDE or QoderWork",
+    )
     args = parser.parse_args()
     if args.action == "install":
         result = install(args.repo.resolve(), args.qoder_home.expanduser())

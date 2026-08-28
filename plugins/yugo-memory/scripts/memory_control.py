@@ -18,18 +18,12 @@ from recall_common import extract_terms, normalize_text
 from recall_index import adaptive_context_budget, default_paths, read_evidence, search_index
 
 
-CONTROL_SCHEMA_VERSION = 1
+CONTROL_SCHEMA_VERSION = 2
 MAX_TASK_ITEMS = 18
 MAX_ITEM_CHARS = 420
 HISTORY_DEPENDENCY_RE = re.compile(
     r"之前|上次|当时|最早|最近|最新|第\s*\d+\s*(?:次|轮|条)|另一个(?:分支|会话|窗口)|"
     r"previous|earlier|last time|another (?:thread|session|window)|\brecall\b",
-    re.IGNORECASE,
-)
-CONTINUITY_RE = re.compile(
-    r"^(?:继续|接着|然后|另外|此外|补充|再|还要|也要|同时|并且|其中|刚才|"
-    r"这个|这些|上述|前面|剩下|完成|修复|优化|更新|安装|发布)|"
-    r"^(?:continue|also|then|next|additionally|besides|finish|fix|update|install|publish)\b",
     re.IGNORECASE,
 )
 REPLACE_RE = re.compile(
@@ -47,22 +41,6 @@ STATUS_ONLY_RE = re.compile(
     r"what(?:'s| is) the (?:current )?(?:status|progress)|status update)[？?。.!！\s]*$",
     re.IGNORECASE,
 )
-ELLIPTICAL_FOLLOWUP_RE = re.compile(
-    r"(?:还要|也要|再加|补上|一并|与此同时|完成后|最后再|刚才|当前任务|上述|前面|剩下)|"
-    r"^(?:把|将)(?:输出|结果|报告|代码|测试|测试用例|文档|版本|它|这个|这些|上述|前面|剩下|当前)|"
-    r"(?:also|as well|in addition|the current task|the previous|the remaining)",
-    re.IGNORECASE,
-)
-SELF_CONTAINED_TASK_RE = re.compile(
-    r"^(?:请)?(?:设计|撰写|编写|创建|实现|开发|分析|总结|查询|调查|翻译|生成|写|制作)|"
-    r"^(?:please\s+)?(?:design|write|create|build|implement|develop|analy[sz]e|summari[sz]e|"
-    r"query|research|translate|generate)\b",
-    re.IGNORECASE,
-)
-CLEARLY_UNRELATED_RE = re.compile(
-    r"完全无关|与当前无关|另起一个|另开一个|unrelated|separate task|different task",
-    re.IGNORECASE,
-)
 CONSTRAINT_RE = re.compile(
     r"必须|禁止|不要|不得|只能|不能|务必|需要|保留|避免|严禁|"
     r"\bmust\b|\bnever\b|\bdo not\b|\bonly\b|\brequire",
@@ -71,6 +49,11 @@ CONSTRAINT_RE = re.compile(
 ACCEPTANCE_RE = re.compile(
     r"确保|验证|测试|通过|完成后|最终|结果|交付|"
     r"\bverify\b|\btest\b|\bpass\b|\bensure\b|\bdeliver",
+    re.IGNORECASE,
+)
+BLOCKER_RE = re.compile(
+    r"阻塞|卡住|失败|报错|待确认|等待|缺少|无法|未完成|"
+    r"\bblock(?:ed|er)?\b|\bfailed?\b|\berror\b|\bwaiting\b|\bmissing\b|\bpending\b",
     re.IGNORECASE,
 )
 
@@ -140,11 +123,18 @@ def connect_control(path: Path | None = None) -> sqlite3.Connection:
         """
     )
     current = db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
-    if current and int(current[0]) != CONTROL_SCHEMA_VERSION:
-        db.close()
-        raise RuntimeError(
-            f"control database schema {current[0]} is incompatible with {CONTROL_SCHEMA_VERSION}"
-        )
+    if current:
+        version = int(current[0])
+        if version == 1:
+            # v1 mirrored ordinary turns and could leave stale rows when a host
+            # omitted SessionEnd metadata. Task state is explicitly ephemeral,
+            # so migration starts the conservative checkpoint policy cleanly.
+            db.execute("DELETE FROM active_tasks")
+        elif version != CONTROL_SCHEMA_VERSION:
+            db.close()
+            raise RuntimeError(
+                f"control database schema {current[0]} is incompatible with {CONTROL_SCHEMA_VERSION}"
+            )
     db.execute(
         "INSERT OR REPLACE INTO metadata(key,value) VALUES('schema_version',?)",
         (str(CONTROL_SCHEMA_VERSION),),
@@ -157,21 +147,47 @@ def connect_control(path: Path | None = None) -> sqlite3.Connection:
     return db
 
 
+def connect_control_readonly(path: Path | None = None) -> sqlite3.Connection | None:
+    target = path or default_control_path()
+    if not target.is_file():
+        return None
+    db = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA query_only=ON")
+    return db
+
+
 def control_status(control_path: Path | None = None) -> dict[str, Any]:
     target = control_path or default_control_path()
-    db = connect_control(target)
+    db = connect_control_readonly(target)
+    if db is None:
+        return {
+            "ready": False,
+            "control_path": str(target),
+            "schema_version": None,
+            "target_schema_version": CONTROL_SCHEMA_VERSION,
+            "active_tasks": 0,
+            "active_experiences": 0,
+            "experience_revisions": 0,
+            "task_state_is_ephemeral": True,
+            "migration_required_on_next_write": False,
+        }
+    current = db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+    version = int(current[0]) if current else None
     task_count = db.execute("SELECT count(*) FROM active_tasks").fetchone()[0]
     experience_count = db.execute("SELECT count(*) FROM experience_current").fetchone()[0]
     revision_count = db.execute("SELECT count(*) FROM experience_revisions").fetchone()[0]
     db.close()
     return {
-        "ready": True,
+        "ready": version == CONTROL_SCHEMA_VERSION,
         "control_path": str(target),
-        "schema_version": CONTROL_SCHEMA_VERSION,
+        "schema_version": version,
+        "target_schema_version": CONTROL_SCHEMA_VERSION,
         "active_tasks": task_count,
         "active_experiences": experience_count,
         "experience_revisions": revision_count,
         "task_state_is_ephemeral": True,
+        "migration_required_on_next_write": version != CONTROL_SCHEMA_VERSION,
     }
 
 
@@ -187,7 +203,7 @@ def _item_id(kind: str, text: str) -> str:
     return hashlib.sha256(f"{kind}\0{normalize_text(text)}".encode()).hexdigest()[:16]
 
 
-def extract_task_items(user_request: str) -> list[dict[str, str]]:
+def extract_task_items(user_request: str, durable_only: bool = False) -> list[dict[str, str]]:
     cleaned = re.sub(r"<[^>]+>.*?</[^>]+>", " ", user_request or "", flags=re.DOTALL)
     clauses = re.split(r"(?:\r?\n+|[。！？!?；;]+)", cleaned)
     result: list[dict[str, str]] = []
@@ -196,9 +212,14 @@ def extract_task_items(user_request: str) -> list[dict[str, str]]:
         text = _bounded(clause.strip(" -•\t,，"), MAX_ITEM_CHARS)
         if len(text) < 3:
             continue
-        kind = "constraint" if CONSTRAINT_RE.search(text) else (
-            "acceptance" if ACCEPTANCE_RE.search(text) else "requirement"
+        kind = (
+            "constraint" if CONSTRAINT_RE.search(text)
+            else "acceptance" if ACCEPTANCE_RE.search(text)
+            else "action" if BLOCKER_RE.search(text)
+            else "requirement"
         )
+        if durable_only and kind == "requirement":
+            continue
         key = _item_id(kind, text)
         if key in seen:
             continue
@@ -226,15 +247,35 @@ def _task_payload(row: sqlite3.Row | None, profile: str = "standard") -> dict[st
 
 
 def task_status(session_id: str, control_path: Path | None = None, profile: str = "standard") -> dict[str, Any]:
-    db = connect_control(control_path)
+    db = connect_control_readonly(control_path)
+    if db is None:
+        return {"active_task": None, "session_id": session_id, "checkpoint_store_ready": False}
+    current = db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+    if current is None or int(current[0]) != CONTROL_SCHEMA_VERSION:
+        db.close()
+        return {
+            "active_task": None,
+            "session_id": session_id,
+            "checkpoint_store_ready": False,
+            "migration_required_on_next_write": True,
+        }
     row = db.execute("SELECT * FROM active_tasks WHERE session_id=?", (session_id,)).fetchone()
     db.close()
-    return {"active_task": _task_payload(row, profile), "session_id": session_id}
+    return {
+        "active_task": _task_payload(row, profile),
+        "session_id": session_id,
+        "checkpoint_store_ready": True,
+    }
 
 
-def _normalize_items(items: list[Any] | None, user_request: str) -> list[dict[str, str]]:
+def _normalize_items(
+    items: list[Any] | None,
+    user_request: str,
+    *,
+    durable_only: bool = False,
+) -> list[dict[str, str]]:
     if not items:
-        return extract_task_items(user_request)
+        return extract_task_items(user_request, durable_only=durable_only)
     result: list[dict[str, str]] = []
     for raw in items[:MAX_TASK_ITEMS]:
         if isinstance(raw, str):
@@ -253,6 +294,8 @@ def _normalize_items(items: list[Any] | None, user_request: str) -> list[dict[st
             kind = "requirement"
         if status not in {"active", "done", "dropped"}:
             status = "active"
+        if durable_only and kind == "requirement":
+            continue
         result.append({"id": _item_id(kind, text), "kind": kind, "text": text, "status": status})
     return result
 
@@ -269,68 +312,23 @@ def _optimized_objective(explicit_objective: str, items: list[dict[str, str]]) -
     return _bounded("；".join(preferred[:2]), 360)
 
 
-def _task_similarity(left: str, right: str) -> float:
-    if not left or not right:
-        return 0.0
-    return cosine(embed(left), encode(right))
+def _merge_task_items(
+    existing: list[dict[str, str]],
+    proposed: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Keep durable constraints before expendable action notes at the size cap."""
 
-
-def _task_lexical_overlap(left: str, right: str) -> float:
-    left_terms = set(extract_terms(left, max_terms=480))
-    right_terms = set(extract_terms(right, max_terms=160))
-    if not left_terms or not right_terms:
-        return 0.0
-    return len(left_terms & right_terms) / len(right_terms)
-
-
-def _current_task_text(current: sqlite3.Row) -> str:
-    items = json.loads(current["items_json"])
-    active = [str(item.get("text") or "") for item in items if item.get("status") == "active"]
-    return "\n".join((current["objective"], *active))
-
-
-def _auto_task_decision(
-    current: sqlite3.Row,
-    user_request: str,
-    proposed_objective: str,
-) -> dict[str, Any]:
-    """Classify one turn conservatively; uncertainty never mutates the ledger.
-
-    The deterministic local vector is a supporting signal only. It must never be
-    the sole reason to replace an active task, because short elliptical follow-ups
-    often share few surface features with the original objective.
-    """
-
-    request = normalize_text(user_request)
-    current_text = _current_task_text(current)
-    similarity = max(
-        _task_similarity(current["objective"], proposed_objective),
-        _task_similarity(current_text, proposed_objective),
+    by_id = {item["id"]: item for item in existing}
+    for item in proposed:
+        by_id[item["id"]] = item
+    ordered = list(by_id.values())
+    priority = {"constraint": 0, "acceptance": 1, "action": 2, "requirement": 3}
+    ranked = sorted(
+        enumerate(ordered),
+        key=lambda pair: (priority.get(pair[1].get("kind", "requirement"), 2), pair[0]),
     )
-    lexical = _task_lexical_overlap(current_text, proposed_objective)
-    if REPLACE_RE.search(user_request):
-        decision, reason = "replace", "explicit_task_change"
-    elif NOOP_RE.fullmatch(request) or STATUS_ONLY_RE.fullmatch(request):
-        decision, reason = "unchanged", "non_mutating_turn"
-    elif CONTINUITY_RE.search(user_request.strip()) or ELLIPTICAL_FOLLOWUP_RE.search(user_request):
-        decision, reason = "amend", "explicit_or_elliptical_followup"
-    elif lexical >= 0.18 or similarity >= 0.30:
-        decision, reason = "amend", "related_content"
-    elif CLEARLY_UNRELATED_RE.search(user_request) or (
-        SELF_CONTAINED_TASK_RE.search(user_request.strip())
-        and lexical <= 0.08
-        and similarity < 0.14
-    ):
-        decision, reason = "replace", "independent_task"
-    else:
-        decision, reason = "ambiguous", "preserve_active_task"
-    return {
-        "decision": decision,
-        "reason": reason,
-        "objective_similarity": round(similarity, 4),
-        "lexical_overlap": round(lexical, 4),
-        "needs_disambiguation": decision == "ambiguous",
-    }
+    keep = {index for index, _item in ranked[:MAX_TASK_ITEMS]}
+    return [item for index, item in enumerate(ordered) if index in keep]
 
 
 def sync_task(
@@ -376,33 +374,55 @@ def sync_task(
             "active_task": _task_payload(current, profile),
         }
 
-    proposed_items = _normalize_items(items, request_text)
+    if action == "auto" and current is None:
+        db.close()
+        return {
+            "transition": "untracked",
+            "transition_reason": "explicit_start_required",
+            "objective_similarity": None,
+            "lexical_overlap": None,
+            "needs_disambiguation": False,
+            "active_task": None,
+        }
+    if action == "auto" and REPLACE_RE.search(request_text):
+        removed_task_id = current["task_id"] if current else None
+        with db:
+            db.execute("DELETE FROM active_tasks WHERE session_id=?", (session_id,))
+        db.close()
+        return {
+            "transition": "cleared",
+            "transition_reason": "explicit_task_change_requires_new_checkpoint",
+            "previous_task_id": removed_task_id,
+            "objective_similarity": None,
+            "lexical_overlap": None,
+            "needs_disambiguation": False,
+            "active_task": None,
+        }
+
+    proposed_items = _normalize_items(
+        items,
+        request_text,
+        durable_only=action == "auto",
+    )
+    if action == "auto" and not proposed_items:
+        db.close()
+        return {
+            "transition": "unchanged",
+            "transition_reason": "no_durable_checkpoint_change",
+            "objective_similarity": None,
+            "lexical_overlap": None,
+            "needs_disambiguation": False,
+            "active_task": _task_payload(current, profile),
+        }
     proposed_objective = _optimized_objective(objective, proposed_items)
     if not proposed_objective:
         db.close()
         raise ValueError("user_request or objective is required")
     should_replace = action in {"start", "replace"} or current is None
-    reason = "explicit" if action in {"start", "replace", "amend"} else "auto"
+    reason = "explicit" if action in {"start", "replace", "amend"} else "durable_checkpoint_change"
     similarity = None
     lexical_overlap = None
     needs_disambiguation = False
-    if current is not None and action == "auto":
-        classification = _auto_task_decision(current, user_request, proposed_objective)
-        similarity = classification["objective_similarity"]
-        lexical_overlap = classification["lexical_overlap"]
-        reason = classification["reason"]
-        needs_disambiguation = classification["needs_disambiguation"]
-        if classification["decision"] in {"unchanged", "ambiguous"}:
-            db.close()
-            return {
-                "transition": classification["decision"],
-                "transition_reason": reason,
-                "objective_similarity": similarity,
-                "lexical_overlap": lexical_overlap,
-                "needs_disambiguation": needs_disambiguation,
-                "active_task": _task_payload(current, profile),
-            }
-        should_replace = classification["decision"] == "replace"
     if current is not None and action == "amend":
         should_replace = False
 
@@ -427,10 +447,7 @@ def sync_task(
     else:
         task_id = current["task_id"]
         existing = json.loads(current["items_json"])
-        by_id = {item["id"]: item for item in existing}
-        for item in proposed_items:
-            by_id[item["id"]] = item
-        merged = list(by_id.values())[-MAX_TASK_ITEMS:]
+        merged = _merge_task_items(existing, proposed_items)
         refs = json.loads(current["source_refs_json"])
         for ref in source_refs or []:
             if ref not in refs:
@@ -574,7 +591,14 @@ def recall_experiences(
     control_path: Path | None = None,
     profile: str = "standard",
 ) -> dict[str, Any]:
-    db = connect_control(control_path)
+    db = connect_control_readonly(control_path)
+    if db is None:
+        return {
+            "query": query,
+            "results": [],
+            "answerability": "insufficient_evidence",
+            "must_verify_conversation_evidence_before_exact_reuse": True,
+        }
     rows = db.execute(
         """SELECT r.* FROM experience_current c
              JOIN experience_revisions r
@@ -635,13 +659,7 @@ def prepare_context(
         target, current_session_id or session_id, context_window, context_tokens_used, "auto"
     )
     profile = budget["profile"]
-    task = sync_task(
-        session_id=session_id,
-        user_request=user_request,
-        action="auto",
-        control_path=control_path,
-        profile=profile,
-    )
+    task = task_status(session_id=session_id, control_path=control_path, profile=profile)
     experience = recall_experiences(user_request, 3, control_path, profile)
     should_recall = include_recall == "yes" or (
         include_recall == "auto" and bool(HISTORY_DEPENDENCY_RE.search(user_request))
@@ -674,9 +692,9 @@ def prepare_context(
     return {
         "context_budget": budget,
         "active_task": active,
-        "task_transition": task.get("transition"),
-        "task_transition_reason": task.get("transition_reason"),
-        "task_needs_disambiguation": task.get("needs_disambiguation", False),
+        "task_transition": "read",
+        "task_transition_reason": "prepare_context_is_read_only",
+        "task_needs_disambiguation": False,
         "experience_memory": experience,
         "conversation_recall": recall,
         "response_contract": {
@@ -691,10 +709,10 @@ def compact_hint(session_id: str, control_path: Path | None = None) -> str:
     payload = task_status(session_id, control_path, "minimal")["active_task"]
     base = (
         f"Yugo Memory continuity for session {session_id}; current_session_id={session_id}. "
-        "Use prepare_context when hidden history or a "
-        "multi-step task matters; it budgets output automatically. During an active multi-step task, "
-        "observe each substantive turn with task_update(action=auto, profile=minimal); acknowledgements "
-        "and status checks do not mutate it. Verify exact facts with read_evidence."
+        "Use prepare_context when hidden history or post-compaction continuity matters; it is read-only "
+        "and budgets output automatically. The active checkpoint is only for durable user constraints, "
+        "acceptance criteria, and blockers; do not mirror every turn into it. Verify exact facts with "
+        "read_evidence."
     )
     if not payload:
         return base

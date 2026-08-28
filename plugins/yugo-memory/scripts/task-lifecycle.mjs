@@ -11,18 +11,29 @@ try {
 } catch {}
 
 function findSessionId(value, depth = 0) {
-  if (!value || typeof value !== 'object' || depth > 2) return '';
+  if (!value || typeof value !== 'object' || depth > 6) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = findSessionId(item, depth + 1);
+      if (nested) return nested;
+    }
+    return '';
+  }
   for (const key of ['session_id', 'sessionId', 'thread_id', 'threadId', 'conversation_id', 'conversationId']) {
     if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
   }
-  for (const key of ['session', 'thread', 'conversation', 'context', 'client', '_meta']) {
+  for (const key of ['session', 'thread', 'conversation', 'context', 'client', '_meta', 'hook', 'payload', 'data', 'event', 'details']) {
     const nested = findSessionId(value[key], depth + 1);
     if (nested) return nested;
   }
   return '';
 }
 
-const sessionId = findSessionId(hookInput);
+const sessionId = findSessionId(hookInput)
+  || process.env.CODEX_THREAD_ID
+  || process.env.QODER_SESSION_ID
+  || process.env.YUGO_MEMORY_SESSION_ID
+  || '';
 if (!sessionId) process.exit(0);
 const controlScript = path.join(path.dirname(process.argv[1]), 'memory_control.py');
 const result = spawnSync('python3', [controlScript, 'clear-task', '--session-id', sessionId], {

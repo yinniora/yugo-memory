@@ -183,7 +183,8 @@ test('compact hook resolves exact nested thread metadata', () => {
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.match(payload.hookSpecificOutput.additionalContext, /current_session_id=fictional-nested-thread/);
-  assert.match(payload.hookSpecificOutput.additionalContext, /task_update\(action=auto, profile=minimal\)/);
+  assert.match(payload.hookSpecificOutput.additionalContext, /durable user constraints/);
+  assert.doesNotMatch(payload.hookSpecificOutput.additionalContext, /every substantive turn/);
 });
 
 test('imports compacted archives from prior local memory roots without an upstream executable', () => {

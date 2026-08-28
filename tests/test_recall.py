@@ -217,6 +217,15 @@ class RecallTests(unittest.TestCase):
         result = search_index(self.index_db, "星图目录为什么固定为七万三千键空间", mode="auto", limit=5)
         self.assertIn(result["results"][0]["session_id"], {"atlas-session", "duplicate-session"})
 
+    def test_selective_lexical_route_bypasses_broad_cascade(self) -> None:
+        result = search_index(
+            self.index_db, "democtl build config atlas", mode="auto", limit=5,
+        )
+        self.assertTrue(result["strict_lexical_bypass"])
+        self.assertFalse(result["local_vector_used"])
+        self.assertIn("strict-lexical", result["results"][0]["routes"])
+        self.assertEqual(result["results"][0]["line_start"], self.atlas_starts["a6"])
+
     def test_temporal_query_distinguishes_earliest_and_latest(self) -> None:
         earliest = search_index(self.index_db, "最早的样本档案保留规则", mode="auto", limit=3)
         latest = search_index(self.index_db, "最新的样本档案保留规则", mode="auto", limit=3)
@@ -425,7 +434,7 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(target_score, 1.0)
 
     def test_late_interaction_and_graph_routes_are_exercised(self) -> None:
-        result = search_index(self.index_db, "ledger checkpoint resume 恢复", mode="auto", limit=8)
+        result = search_index(self.index_db, "ledger checkpoint resume 恢复", mode="deep", limit=8)
         self.assertIn("late-interaction", result["results"][0]["routes"])
         self.assertGreater(result["results"][0]["late_interaction_similarity"], 0)
         self.assertTrue(any(

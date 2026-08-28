@@ -19,7 +19,7 @@ from memory_control import (
 from recall_index import default_paths, index_status, read_evidence, search_index
 
 
-SERVER_VERSION = "1.4.2"
+SERVER_VERSION = "1.5.0"
 SESSION_ID_KEYS = (
     "session_id", "sessionId", "thread_id", "threadId", "conversation_id", "conversationId",
 )
@@ -95,8 +95,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "prepare_context",
             "description": (
-                "Prepare a context-budgeted continuity packet for a substantive multi-step task. "
-                "It automatically starts, amends, or replaces the ephemeral task checklist, recalls "
+                "Prepare a read-only, context-budgeted continuity packet after compaction or when "
+                "hidden history matters. It reads an optional durable task checkpoint, recalls "
                 "relevant versioned experience, and recalls conversation evidence only when the request "
                 "depends on older history. Short standalone requests should skip this tool."
             ),
@@ -115,7 +115,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
             "annotations": {
                 "title": "Prepare Adaptive Memory Context",
-                "readOnlyHint": False,
+                "readOnlyHint": True,
                 "destructiveHint": False,
                 "idempotentHint": True,
                 "openWorldHint": False,
@@ -124,10 +124,11 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "task_update",
             "description": (
-                "Update the ephemeral per-session task objective and optimized instruction checklist. "
-                "Minimal auto mode is suitable for each substantive turn: acknowledgements do not mutate, "
-                "follow-ups amend, clearly independent tasks replace, and ambiguity preserves the current "
-                "objective. Complete, cancel, and clear permanently remove the checklist."
+                "Manage an optional ephemeral task checkpoint for durable user constraints, acceptance "
+                "criteria, and blockers. Explicit start/replace establishes the objective. Auto never "
+                "creates or replaces a checkpoint: it only adds durable clauses to an existing one, and "
+                "an explicit task-change phrase clears stale state. Ordinary turns should not call this tool. "
+                "Complete, cancel, and clear permanently remove the checkpoint."
             ),
             "inputSchema": {
                 "type": "object",
@@ -263,7 +264,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "recall",
             "description": (
-                "Recall exact evidence from long Codex or Qoder conversations with calibrated local hybrid retrieval: "
+                "Recall exact evidence from long Codex or Qoder app conversations with calibrated local hybrid retrieval: "
                 "direct anchors, multilingual session/episode routing, multi-facet late interaction, LSH, "
                 "sparse graph expansion, diverse evidence sets, deduplication, typed file descriptors, "
                 "visible tool/code/command evidence nodes, and raw-line anchors. Use after compaction or whenever older exact "

@@ -11,23 +11,34 @@ try {
 } catch {}
 
 function findSessionId(value, depth = 0) {
-  if (!value || typeof value !== 'object' || depth > 2) return '';
+  if (!value || typeof value !== 'object' || depth > 6) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = findSessionId(item, depth + 1);
+      if (nested) return nested;
+    }
+    return '';
+  }
   for (const key of ['session_id', 'sessionId', 'thread_id', 'threadId', 'conversation_id', 'conversationId']) {
     if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
   }
-  for (const key of ['session', 'thread', 'conversation', 'context', 'client', '_meta']) {
+  for (const key of ['session', 'thread', 'conversation', 'context', 'client', '_meta', 'hook', 'payload', 'data', 'event', 'details']) {
     const nested = findSessionId(value[key], depth + 1);
     if (nested) return nested;
   }
   return '';
 }
 
-const sessionId = findSessionId(hookInput);
+const sessionId = findSessionId(hookInput)
+  || process.env.CODEX_THREAD_ID
+  || process.env.QODER_SESSION_ID
+  || process.env.YUGO_MEMORY_SESSION_ID
+  || '';
 const controlScript = path.join(path.dirname(process.argv[1]), 'memory_control.py');
 let additionalContext = [
-  'Yugo Memory: after compaction, use prepare_context for hidden history or multi-step continuity; it selects the response profile automatically.',
+  'Yugo Memory: after compaction, use read-only prepare_context for hidden history or continuity; it selects the response profile automatically.',
   sessionId ? `current_session_id=${sessionId}.` : '',
-  'During an active multi-step task, observe each substantive user turn with task_update(action=auto, profile=minimal); acknowledgements and status checks do not mutate it.',
+  'Task checkpoints are optional and only preserve durable user constraints, acceptance criteria, and blockers; do not mirror every turn or ordinary follow-up into them.',
   'Verify exact facts with read_evidence; summaries are navigation only; abstain when evidence is insufficient.',
 ].filter(Boolean).join(' ');
 if (sessionId) {
