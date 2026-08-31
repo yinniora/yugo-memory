@@ -309,3 +309,60 @@ test('canonical hard link preserves the seven-day deletion grace without duplica
   assert.match(result.stdout, /"expiredDeletes"/);
   assert.equal(fs.existsSync(canonical), false);
 });
+
+test('retains every rollover segment under one logical Codex conversation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yugo-memory-rollover-'));
+  const codexHome = path.join(root, 'codex');
+  const memoryRoot = path.join(root, 'memory');
+  const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const middleId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const latestId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const day = path.join(codexHome, 'sessions', '2038', '04');
+  const sources = [
+    path.join(day, `rollout-2038-04-01-${sessionId}.jsonl`),
+    path.join(day, `rollout-2038-04-02-${sessionId}_${middleId}.jsonl`),
+    path.join(day, `rollout-2038-04-03-${sessionId}_${latestId}.jsonl`),
+  ];
+  writeJsonl(sources[0], [
+    { type: 'session_meta', payload: { id: sessionId, cwd: '/demo/fictional' } },
+    { type: 'response_item', payload: { role: 'user', content: 'fictional earliest detail' } },
+    { type: 'compacted', payload: { replacement: 'routing summary' } },
+  ]);
+  writeJsonl(sources[1], [
+    { type: 'session_meta', payload: { id: sessionId, cwd: '/demo/fictional' } },
+    { type: 'response_item', payload: { role: 'user', content: 'fictional middle detail' } },
+  ]);
+  writeJsonl(sources[2], [
+    { type: 'session_meta', payload: { id: sessionId, cwd: '/demo/fictional' } },
+    { type: 'response_item', payload: { role: 'user', content: 'fictional latest detail' } },
+  ]);
+  const stateDb = path.join(codexHome, 'state_5.sqlite');
+  createStateDb(stateDb, [[sessionId, 0]]);
+  const env = {
+    ...process.env,
+    YUGO_MEMORY_INCLUDE_QODER: '0',
+    CODEX_HOME: codexHome,
+    YUGO_MEMORY_HOME: memoryRoot,
+    YUGO_MEMORY_SKIP_INDEX: '1',
+    YUGO_MEMORY_LEGACY_ARCHIVE_DIR: path.join(root, 'no-legacy'),
+  };
+
+  let result = spawnSync(process.execPath, [memoryScript], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /"activeSourceSessions": 1/);
+  assert.match(result.stdout, /"activeSourceSegments": 3/);
+  assert.match(result.stdout, /"compactedLongSegments": 3/);
+  for (const [index, segmentId] of [sessionId, middleId, latestId].entries()) {
+    const archive = canonicalArchive(memoryRoot, segmentId);
+    assert.equal(fs.existsSync(archive), true);
+    assert.equal(fs.statSync(archive).ino, fs.statSync(sources[index]).ino);
+  }
+
+  fs.unlinkSync(stateDb);
+  createStateDb(stateDb, [[sessionId, 1]]);
+  result = spawnSync(process.execPath, [memoryScript], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stderr);
+  for (const segmentId of [sessionId, middleId, latestId]) {
+    assert.equal(fs.existsSync(canonicalArchive(memoryRoot, segmentId)), false);
+  }
+});

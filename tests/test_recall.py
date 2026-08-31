@@ -518,6 +518,44 @@ class RecallTests(unittest.TestCase):
         self.assertEqual("".join(pieces), archive.read_text(encoding="utf-8"))
         self.assertLessEqual(max(len(piece) for piece in pieces), 25_000)
 
+    def test_rollover_segments_recall_earliest_middle_latest_and_abstain(self) -> None:
+        archives = self.root / "rollover-archives"
+        index_db = self.root / "rollover-index.sqlite"
+        session_id = "fictional-rollover-session"
+        segments = [
+            ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "first-orchid-731", "最早规则是使用紫色账本。"),
+            ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "middle-cobalt-482", "中间决定是启用钴蓝检查点。"),
+            ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "latest-amber-915", "最新决定是切换到琥珀路由。"),
+        ]
+        for offset, (segment_id, anchor, answer) in enumerate(segments, 1):
+            archive = archives / "by-session" / segment_id[:2] / f"{segment_id}.jsonl"
+            write_archive(
+                archive,
+                session_id,
+                [(f"s{offset}", f"请记录虚构标识 {anchor}", answer)],
+            )
+            archive.write_text(
+                archive.read_text(encoding="utf-8").replace("2038-01-", f"2038-0{offset}-"),
+                encoding="utf-8",
+            )
+        sync_index(archives, index_db)
+
+        queries = (
+            ("虚构标识最早的具体内容", "first-orchid-731"),
+            ("钴蓝检查点 middle-cobalt-482", "middle-cobalt-482"),
+            ("虚构标识最新的具体内容", "latest-amber-915"),
+        )
+        for query, anchor in queries:
+            result = search_index(
+                index_db, query, mode="auto", limit=8, current_session_id=session_id,
+            )
+            self.assertTrue(result["safe_to_answer"])
+            self.assertIn(anchor, result["results"][0]["snippet"])
+
+        missing = search_index(index_db, "never-existed-saffron-000", mode="auto", limit=3)
+        self.assertEqual(missing["answerability"], "insufficient_evidence")
+        self.assertFalse(missing["safe_to_answer"])
+
     def test_reader_does_not_materialize_a_sparse_600mb_line(self) -> None:
         archive = self.root / "synthetic-sparse.jsonl"
         with archive.open("wb") as handle:

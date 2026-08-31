@@ -71,33 +71,65 @@ function relativeMap(root) {
   return new Map(walkJsonl(root).map(file => [path.relative(root, file), file]));
 }
 
-function sessionIdFromFile(file) {
-  const match = path.basename(file).match(/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.jsonl$/i);
-  return match ? match[1] : null;
+const UUID_PATTERN = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/ig;
+
+function identityFromFile(file) {
+  const ids = path.basename(file).match(UUID_PATTERN) || [];
+  const fallback = ids.at(-1) || null;
+  let sessionId = null;
+  const fd = fs.openSync(file, 'r');
+  const buffer = Buffer.allocUnsafe(256 * 1024);
+  try {
+    const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    for (const line of buffer.subarray(0, read).toString('utf8').split('\n').slice(0, 128)) {
+      if (!line.trim()) continue;
+      try {
+        const row = JSON.parse(line);
+        if (row?.type === 'session_meta') {
+          sessionId = row?.payload?.id || row?.sessionId || row?.payload?.sessionId || null;
+        } else if (row?.type === 'runtime-config') {
+          sessionId = row?.sessionId || row?.payload?.sessionId || null;
+        }
+        if (sessionId) break;
+      } catch {}
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { sessionId: sessionId || fallback, segmentId: fallback || sessionId };
 }
 
-function archivedSessionMap(root) {
+function conversationSegmentMap(root) {
   const result = new Map();
   for (const file of walkJsonl(root)) {
-    const sessionId = sessionIdFromFile(file);
-    if (!sessionId) continue;
-    const previous = result.get(sessionId);
+    const identity = identityFromFile(file);
+    if (!identity.sessionId || !identity.segmentId) continue;
+    const previous = result.get(identity.segmentId);
     if (!previous) {
-      result.set(sessionId, file);
+      result.set(identity.segmentId, { file, ...identity });
       continue;
     }
     const candidateStat = fs.statSync(file);
-    const previousStat = fs.statSync(previous);
+    const previousStat = fs.statSync(previous.file);
     if (
       candidateStat.size > previousStat.size
       || (candidateStat.size === previousStat.size && candidateStat.mtimeMs > previousStat.mtimeMs)
-    ) result.set(sessionId, file);
+    ) result.set(identity.segmentId, { file, ...identity });
   }
   return result;
 }
 
-function canonicalArchivePath(sessionId) {
-  return path.join(archiveRoot, 'by-session', sessionId.slice(0, 2), `${sessionId}.jsonl`);
+function groupSegmentsBySession(segments) {
+  const result = new Map();
+  for (const item of segments.values()) {
+    if (!result.has(item.sessionId)) result.set(item.sessionId, []);
+    result.get(item.sessionId).push(item);
+  }
+  return result;
+}
+
+function canonicalArchivePath(segmentId) {
+  return path.join(archiveRoot, 'by-session', segmentId.slice(0, 2), `${segmentId}.jsonl`);
 }
 
 function parseThreadRows(text) {
@@ -268,15 +300,15 @@ function replaceWithSourceLink(source, destination) {
 function canonicalizeArchives() {
   const groups = new Map();
   for (const file of walkJsonl(archiveRoot)) {
-    const sessionId = sessionIdFromFile(file);
-    if (!sessionId) continue;
-    if (!groups.has(sessionId)) groups.set(sessionId, []);
-    groups.get(sessionId).push(file);
+    const { segmentId } = identityFromFile(file);
+    if (!segmentId) continue;
+    if (!groups.has(segmentId)) groups.set(segmentId, []);
+    groups.get(segmentId).push(file);
   }
   let canonicalized = 0;
   let duplicatesRemoved = 0;
-  for (const [sessionId, files] of groups) {
-    const canonical = canonicalArchivePath(sessionId);
+  for (const [segmentId, files] of groups) {
+    const canonical = canonicalArchivePath(segmentId);
     const best = [...files].sort((left, right) => {
       const leftStat = fs.statSync(left);
       const rightStat = fs.statSync(right);
@@ -307,8 +339,8 @@ function refreshArchives(longSources) {
   let refreshed = 0;
   let hardlinked = 0;
   let copied = 0;
-  for (const [sessionId, source] of longSources) {
-    const result = replaceWithSourceLink(source, canonicalArchivePath(sessionId));
+  for (const [segmentId, sourceInfo] of longSources) {
+    const result = replaceWithSourceLink(sourceInfo.file, canonicalArchivePath(segmentId));
     if (result.changed) refreshed += 1;
     if (result.mode === 'hardlink') hardlinked += 1;
     else copied += 1;
@@ -403,91 +435,110 @@ function doctorReport() {
 }
 
 async function main() {
-  const activeSources = archivedSessionMap(sourceRoot);
-  const archivedSources = archivedSessionMap(archivedSourceRoot);
-  const qoderSources = includeQoder ? archivedSessionMap(qoderSourceRoot) : new Map();
+  const activeSources = conversationSegmentMap(sourceRoot);
+  const archivedSources = conversationSegmentMap(archivedSourceRoot);
+  const qoderSources = includeQoder ? conversationSegmentMap(qoderSourceRoot) : new Map();
   const threadStates = loadThreadStates();
   const sources = new Map();
-  for (const [sessionId, file] of activeSources) {
-    const threadState = sessionId ? threadStates?.get(sessionId) : null;
+  for (const [segmentId, source] of activeSources) {
+    const threadState = source.sessionId ? threadStates?.get(source.sessionId) : null;
     if (!threadStates || (threadState && !threadState.archived)) {
-      sources.set(sessionId, { file, sourceAgent: 'codex' });
+      sources.set(segmentId, { ...source, sourceAgent: 'codex' });
     }
   }
-  for (const [sessionId, file] of qoderSources) {
-    // UUID collisions across independent agents are vanishingly unlikely. If
-    // one occurs, keep the Codex source and fail closed rather than merge two
-    // raw conversations under one identity.
-    if (!sources.has(sessionId)) sources.set(sessionId, { file, sourceAgent: 'qoder' });
+  for (const [segmentId, source] of qoderSources) {
+    // Physical segment UUID collisions across independent agents are
+    // vanishingly unlikely. If one occurs, keep Codex and fail closed.
+    if (!sources.has(segmentId)) sources.set(segmentId, { ...source, sourceAgent: 'qoder' });
   }
 
   const state = loadState();
   const legacyMigrations = await migrateLegacyArchives(state);
   const canonicalization = canonicalizeArchives();
-  const longSources = new Map();
-  for (const [sessionId, sourceInfo] of sources) {
-    const { file, sourceAgent } = sourceInfo;
+  const directlyLongSegments = new Set();
+  for (const [segmentId, sourceInfo] of sources) {
+    const { file, sourceAgent, sessionId } = sourceInfo;
     const stat = fs.statSync(file);
-    const statusKey = `${sourceAgent}:${sessionId}`;
-    const cached = state.sourceStatus[statusKey] || state.sourceStatus[sessionId];
+    const statusKey = `${sourceAgent}:${segmentId}`;
+    const cached = state.sourceStatus[statusKey] || state.sourceStatus[segmentId];
     let isLong;
     if (cached?.long === true) isLong = true;
     else if (cached?.size === stat.size && cached?.mtimeMs === stat.mtimeMs) isLong = false;
     else if (sourceAgent === 'codex') isLong = await crossedCompactionBoundary(file);
     else isLong = Boolean(probeLongSource(file).long);
     state.sourceStatus[statusKey] = {
-      path: file, size: stat.size, mtimeMs: stat.mtimeMs, long: isLong, sourceAgent,
+      path: file, size: stat.size, mtimeMs: stat.mtimeMs, long: isLong,
+      sourceAgent, sessionId, segmentId,
     };
-    delete state.sourceStatus[sessionId];
-    if (isLong) longSources.set(sessionId, file);
+    delete state.sourceStatus[segmentId];
+    if (isLong) directlyLongSegments.add(segmentId);
   }
+  // A rollover segment may not contain its own compaction marker. Once any
+  // physical segment crosses the boundary, retain every segment belonging to
+  // the same logical conversation so its newest raw tail cannot disappear.
+  const longSessionIds = new Set(
+    [...directlyLongSegments].map(segmentId => sources.get(segmentId).sessionId),
+  );
+  const longSources = new Map(
+    [...sources].filter(([, source]) => longSessionIds.has(source.sessionId)),
+  );
   for (const statusKey of Object.keys(state.sourceStatus)) {
     const split = statusKey.indexOf(':');
     const sourceAgent = split >= 0 ? statusKey.slice(0, split) : 'codex';
-    const sessionId = split >= 0 ? statusKey.slice(split + 1) : statusKey;
+    const segmentId = split >= 0 ? statusKey.slice(split + 1) : statusKey;
     if (sourceAgent === 'qoder' && !includeQoder) continue;
     // Preserve the Qoder source marker while its canonical archive is inside
     // the deletion grace period. Qoder does not expose deletion state through
     // Codex's state database and its long boundary need not be a compaction.
-    if (sourceAgent === 'qoder' && fs.existsSync(canonicalArchivePath(sessionId))) continue;
-    if (!sources.has(sessionId)) delete state.sourceStatus[statusKey];
+    if (sourceAgent === 'qoder' && fs.existsSync(canonicalArchivePath(segmentId))) continue;
+    if (!sources.has(segmentId)) delete state.sourceStatus[statusKey];
   }
 
   const immediateDeletes = [];
   const expiredDeletes = [];
   const pendingDeletes = [];
-  for (const [sessionId, archive] of archivedSessionMap(archiveRoot)) {
-    if (!includeQoder && state.sourceStatus[`qoder:${sessionId}`]) {
+  const existingArchives = conversationSegmentMap(archiveRoot);
+  const archiveGroups = groupSegmentsBySession(existingArchives);
+  const sourceGroups = groupSegmentsBySession(sources);
+  const archivedSourceGroups = groupSegmentsBySession(archivedSources);
+  for (const [sessionId, archives] of archiveGroups) {
+    const knownQoderStatuses = Object.values(state.sourceStatus).filter(status => (
+      status?.sourceAgent === 'qoder' && status?.sessionId === sessionId
+    ));
+    if (!includeQoder && knownQoderStatuses.length) {
       delete state.missingSince[sessionId];
       continue;
     }
     const threadState = sessionId ? threadStates?.get(sessionId) : null;
-    const isKnownQoder = Boolean(state.sourceStatus[`qoder:${sessionId}`]);
-    const archivedByFallback = !threadStates && sessionId && archivedSources.has(sessionId);
+    const isKnownQoder = knownQoderStatuses.length > 0;
+    const archivedByFallback = !threadStates && sessionId && archivedSourceGroups.has(sessionId);
     if (threadState?.archived || archivedByFallback) {
-      immediateDeletes.push({ sessionId, archive, reason: 'codex_thread_archived' });
+      immediateDeletes.push({ sessionId, archives, reason: 'codex_thread_archived' });
       delete state.missingSince[sessionId];
       continue;
     }
-    const source = sources.get(sessionId)?.file;
-    if (source && !longSources.has(sessionId)) {
-      immediateDeletes.push({ sessionId, archive, reason: 'below_compaction_boundary' });
+    const sessionSources = sourceGroups.get(sessionId) || [];
+    if (sessionSources.length && !longSessionIds.has(sessionId)) {
+      immediateDeletes.push({ sessionId, archives, reason: 'below_compaction_boundary' });
       delete state.missingSince[sessionId];
       continue;
     }
-    if (source || (threadStates && threadState && !threadState.archived)) {
+    if (sessionSources.length || (threadStates && threadState && !threadState.archived)) {
       delete state.missingSince[sessionId];
       continue;
     }
-    if (!isKnownQoder && !(await crossedCompactionBoundary(archive))) {
-      immediateDeletes.push({ sessionId, archive, reason: 'legacy_short_archive' });
+    const archiveHasCompaction = isKnownQoder || (await Promise.all(
+      archives.map(archive => crossedCompactionBoundary(archive.file)),
+    )).some(Boolean);
+    if (!archiveHasCompaction) {
+      immediateDeletes.push({ sessionId, archives, reason: 'legacy_short_archive' });
       delete state.missingSince[sessionId];
       continue;
     }
     const missingSince = Number(state.missingSince[sessionId] || now);
     state.missingSince[sessionId] = missingSince;
     if (now - missingSince >= deletedRetentionMs) {
-      expiredDeletes.push({ sessionId, archive, missingSince });
+      expiredDeletes.push({ sessionId, archives, missingSince });
     }
     else pendingDeletes.push({
       sessionId,
@@ -500,13 +551,18 @@ async function main() {
     mode: dryRun ? 'dry-run' : 'apply',
     runtimeDependency: 'none',
     remoteServerRequired: false,
-    activeSourceSessions: activeSources.size,
-    qoderSourceSessions: qoderSources.size,
-    archivedSourceSessions: archivedSources.size,
+    activeSourceSessions: groupSegmentsBySession(activeSources).size,
+    activeSourceSegments: activeSources.size,
+    qoderSourceSessions: groupSegmentsBySession(qoderSources).size,
+    qoderSourceSegments: qoderSources.size,
+    archivedSourceSessions: groupSegmentsBySession(archivedSources).size,
+    archivedSourceSegments: archivedSources.size,
     codexStateDatabaseAvailable: threadStates !== null,
-    compactedLongSessions: longSources.size,
-    belowBoundarySessions: sources.size - longSources.size,
-    existingArchives: archivedSessionMap(archiveRoot).size,
+    compactedLongSessions: longSessionIds.size,
+    compactedLongSegments: longSources.size,
+    belowBoundarySessions: groupSegmentsBySession(sources).size - longSessionIds.size,
+    existingArchives: existingArchives.size,
+    existingArchiveSessions: archiveGroups.size,
     legacyMigrations,
     canonicalization,
     immediateDeletes: immediateDeletes.map(({ sessionId, reason }) => ({ sessionId, reason })),
@@ -518,17 +574,20 @@ async function main() {
 
   const removed = [];
   for (const item of [...immediateDeletes, ...expiredDeletes]) {
-    removeFile(item.archive, removed);
-    pruneEmptyParents(item.archive, archiveRoot);
+    for (const archive of item.archives) {
+      removeFile(archive.file, removed);
+      pruneEmptyParents(archive.file, archiveRoot);
+      delete state.sourceStatus[`qoder:${archive.segmentId}`];
+    }
     delete state.missingSince[item.sessionId];
-    delete state.sourceStatus[`qoder:${item.sessionId}`];
   }
   const archiveRefresh = refreshArchives(longSources);
   const indexReport = runIndex();
   if (!dryRun) saveState(state);
   output({
     completed: true,
-    archivedLongSessions: longSources.size,
+    archivedLongSessions: longSessionIds.size,
+    archivedLongSegments: longSources.size,
     archiveRefresh,
     [dryRun ? 'plannedMemoryFileDeletes' : 'permanentlyDeletedMemoryFiles']: removed.length,
     pendingDeletedSessions: pendingDeletes.length,

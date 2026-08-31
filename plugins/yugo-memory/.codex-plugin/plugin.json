@@ -1,6 +1,6 @@
 {
   "name": "yugo-memory",
-  "version": "1.5.0+codex.20260828130932",
+  "version": "1.5.1+codex.20260831023343",
   "description": "Private cross-agent conversation recall, adaptive context budgeting, optional task checkpoints, and evidence-linked experience memory.",
   "author": {
     "name": "Yugo Memory contributors",

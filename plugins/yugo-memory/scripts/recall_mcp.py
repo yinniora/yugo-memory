@@ -19,7 +19,7 @@ from memory_control import (
 from recall_index import default_paths, index_status, read_evidence, search_index
 
 
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.5.1"
 SESSION_ID_KEYS = (
     "session_id", "sessionId", "thread_id", "threadId", "conversation_id", "conversationId",
 )

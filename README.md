@@ -2,18 +2,18 @@
 
 Standalone, event-driven, full-fidelity long-conversation memory and task continuity for Codex and Qoder app.
 
-Codex conversations enter memory only after a real context-compaction event. Qoder app conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per long session; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
+Codex conversations enter memory only after a real context-compaction event. Qoder app conversations use their declared context window and a conservative visible-token estimate to cross an equivalent long-session boundary. Each agent's complete raw JSONL remains the source of truth. Yugo Memory keeps one canonical evidence link per physical rollout segment and groups every rollover under its logical conversation; routes, task lists, experience summaries, compaction summaries, SQLite FTS, and local vectors are navigation aids. Short and temporary tasks never enter the archive.
 
 Here **Qoder app** means `/Applications/Qoder.app` with agent home `~/.qoder`. It is a different product from **Qoder IDE** (`/Applications/Qoder IDE.app`) and QoderWork. The included adapter deliberately modifies only `~/.qoder`; it neither installs into nor changes Qoder IDE or QoderWork.
 
-Yugo Memory 1.5.0 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python.
+Yugo Memory 1.5.1 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python. Version 1.5.1 adds lossless multi-rollout discovery: a long conversation may span multiple JSONL files, all of which remain independently verifiable and searchable under the original task ID.
 
 ## Behavior
 
 | Event or state | Result |
 |---|---|
 | Codex conversation has not compacted | Not copied, summarized, or indexed |
-| `PostCompact` | One canonical hard link is refreshed and incrementally indexed |
+| `PostCompact` | Canonical hard links for every logical-task rollout are refreshed and incrementally indexed |
 | `SessionStart(source=compact)` | Adds a bounded continuity hint and optional durable task checkpoint |
 | Qoder app transcript crosses its adaptive long boundary | Shares one canonical evidence link and index with Codex |
 | Ordinary visible-context turn | No task write and no recall; Codex owns current-task continuity |
@@ -94,9 +94,9 @@ Recall is precision-first. A semantic route cannot validate a missing path, comm
 ## Canonical storage and incremental indexing
 
 - Codex or Qoder app owns the original transcript. Yugo Memory never keeps multiple growing snapshots of one session.
-- Every long session resolves to one canonical evidence path keyed by `session_id`.
+- Every physical rollout resolves to one canonical evidence path keyed by its segment ID, while the raw `session_meta.payload.id` groups rollovers under the original logical conversation.
 - Active long sessions are hard-linked when possible, so the evidence path consumes no additional data blocks on the same filesystem. A private atomic copy is used only when hard links are unavailable.
-- Existing legacy/current snapshots are grouped by `session_id`, the most complete candidate is retained, and redundant versions are removed before indexing.
+- Existing legacy/current snapshots are grouped by physical segment ID, the most complete candidate is retained, and redundant versions are removed before indexing; distinct rollover segments are never collapsed together.
 - When the live agent source is available, any copied legacy candidate is replaced with a hard link to the current source.
 - Parser checkpoints store the next byte and line offsets plus the current unfinished exchange.
 - Append-only files resume at the prior byte offset; existing gigabytes are not parsed again.
