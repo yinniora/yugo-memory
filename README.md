@@ -6,7 +6,7 @@ Codex conversations enter memory only after a real context-compaction event. Qod
 
 Here **Qoder app** means `/Applications/Qoder.app` with agent home `~/.qoder`. It is a different product from **Qoder IDE** (`/Applications/Qoder IDE.app`) and QoderWork. The included adapter deliberately modifies only `~/.qoder`; it neither installs into nor changes Qoder IDE or QoderWork.
 
-Yugo Memory 1.5.1 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python. Version 1.5.1 adds lossless multi-rollout discovery: a long conversation may span multiple JSONL files, all of which remain independently verifiable and searchable under the original task ID.
+Yugo Memory 1.5.2 has no upstream memory runtime, remote server, API key, model download, package installation, or background schedule. It uses Node.js, Python's standard library, and the SQLite FTS5 included with Python. Version 1.5.1 added lossless multi-rollout discovery: a long conversation may span multiple JSONL files, all of which remain independently verifiable and searchable under the original task ID. Version 1.5.2 adds a direct FTS row map so refreshing a large changed rollout no longer performs one full-text-table scan per old node.
 
 ## Behavior
 

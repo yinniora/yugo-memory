@@ -127,6 +127,32 @@ class RecallTests(unittest.TestCase):
         self.assertGreater(db.execute("select count(*) from node_facets").fetchone()[0], 0)
         self.assertGreater(db.execute("select count(*) from node_lsh").fetchone()[0], 0)
         self.assertGreater(db.execute("select count(*) from node_edges").fetchone()[0], 0)
+        self.assertEqual(
+            db.execute("select count(*) from node_fts_rows").fetchone()[0],
+            db.execute("select count(*) from nodes_fts").fetchone()[0],
+        )
+        db.close()
+
+    def test_fts_rowid_map_removes_rewritten_rollout_nodes_without_full_scans(self) -> None:
+        archive = self.archives / "2038" / "rollout-rewrite-55555555-5555-4555-8555-555555555555.jsonl"
+        write_archive(
+            archive, "rewrite-session",
+            [("old", "虚构旧节点 obsolete-violet-314", "它随后会被完整替换。")],
+        )
+        sync_index(self.archives, self.index_db)
+
+        write_archive(
+            archive, "rewrite-session",
+            [("new", "虚构新节点 current-silver-271", "旧节点必须从 FTS 映射移除。")],
+        )
+        sync_index(self.archives, self.index_db)
+        db = sqlite3.connect(self.index_db)
+        self.assertEqual(db.execute("select count(*) from nodes_fts where nodes_fts match 'obsolete'").fetchone()[0], 0)
+        self.assertGreater(db.execute("select count(*) from nodes_fts where nodes_fts match 'current'").fetchone()[0], 0)
+        self.assertEqual(
+            db.execute("select count(*) from node_fts_rows").fetchone()[0],
+            db.execute("select count(*) from nodes_fts").fetchone()[0],
+        )
         db.close()
 
     def test_status_exposes_new_index_capabilities_without_transcript_text(self) -> None:

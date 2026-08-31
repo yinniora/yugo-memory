@@ -289,7 +289,20 @@ def create_schema(db: sqlite3.Connection) -> None:
           terms,
           tokenize='unicode61 remove_diacritics 2'
         );
+        CREATE TABLE IF NOT EXISTS node_fts_rows (
+          node_id TEXT PRIMARY KEY,
+          fts_rowid INTEGER NOT NULL UNIQUE
+        ) WITHOUT ROWID;
         """
+    )
+    # FTS5 UNINDEXED columns cannot accelerate `WHERE node_id=?`. Older
+    # versions deleted one node at a time through that predicate, turning a
+    # large rollover refresh into repeated full FTS scans. This additive map is
+    # rebuilt idempotently for existing databases and makes future deletion a
+    # direct rowid lookup without changing the public index schema.
+    db.execute(
+        """INSERT OR IGNORE INTO node_fts_rows(node_id, fts_rowid)
+             SELECT node_id, rowid FROM nodes_fts"""
     )
     current = db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
     if current and int(current[0]) != SCHEMA_VERSION:
@@ -355,7 +368,15 @@ def _replace_file_nodes(
         db.executemany("DELETE FROM node_lsh WHERE node_id=?", ((node_id,) for node_id in old_ids))
         db.executemany("DELETE FROM node_facets WHERE node_id=?", ((node_id,) for node_id in old_ids))
         db.executemany("DELETE FROM node_anchors WHERE node_id=?", ((node_id,) for node_id in old_ids))
-        db.executemany("DELETE FROM nodes_fts WHERE node_id=?", ((node_id,) for node_id in old_ids))
+        for batch in _chunks(old_ids):
+            placeholders = ",".join("?" for _ in batch)
+            rowids = [
+                row[0] for row in db.execute(
+                    f"SELECT fts_rowid FROM node_fts_rows WHERE node_id IN ({placeholders})", batch,
+                )
+            ]
+            db.executemany("DELETE FROM nodes_fts WHERE rowid=?", ((rowid,) for rowid in rowids))
+            db.execute(f"DELETE FROM node_fts_rows WHERE node_id IN ({placeholders})", batch)
         db.execute("DELETE FROM nodes WHERE archive_path=?", (archive_path,))
     if not nodes:
         return
@@ -366,9 +387,15 @@ def _replace_file_nodes(
         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         nodes,
     )
+    previous_fts_rowid = db.execute("SELECT coalesce(max(rowid), 0) FROM nodes_fts").fetchone()[0]
     db.executemany(
         "INSERT INTO nodes_fts(node_id, terms) VALUES(?, ?)",
         ((row[0], row[12]) for row in nodes),
+    )
+    db.execute(
+        """INSERT OR REPLACE INTO node_fts_rows(node_id, fts_rowid)
+             SELECT node_id, rowid FROM nodes_fts WHERE rowid>?""",
+        (previous_fts_rowid,),
     )
     facets = facets or []
     anchors = anchors or []
