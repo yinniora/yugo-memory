@@ -105,5 +105,77 @@ class PrivacyScanTests(unittest.TestCase):
             temporary.cleanup()
 
 
+    def test_scanner_file_and_new_identifier_formats_are_checked(self) -> None:
+        temporary, root = self._repo()
+        try:
+            target = root / "scripts" / "privacy-scan.py"
+            target.parent.mkdir()
+            fabricated_id = "01af" + "0000-1111-7222-8333-444444444444"
+            fabricated_token = "gh" + "p_" + ("Z" * 36)
+            private_host = "fictional-vault." + "internal"
+            target.write_text("\n".join((fabricated_id, fabricated_token, private_host)), encoding="utf-8")
+            run = subprocess.run(
+                [sys.executable, str(SCANNER), "--root", str(root), "--json"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+            rules = {item["rule"] for item in json.loads(run.stdout)["findings"]}
+            self.assertTrue({"real-thread-id", "provider-token", "internal-domain"} <= rules)
+            for private_value in (fabricated_id, fabricated_token, private_host):
+                self.assertNotIn(private_value, run.stdout)
+        finally:
+            temporary.cleanup()
+
+    def test_commit_and_tag_messages_are_scanned(self) -> None:
+        temporary, root = self._repo()
+        try:
+            (root / "README.md").write_text("Invented fixture.\n", encoding="utf-8")
+            fabricated_token = "gh" + "p_" + ("Y" * 36)
+            self._commit(root, "Synthetic marker " + fabricated_token)
+            fabricated_secret = "api" + "_key=EXAMPLE_NOT_A_REAL_SECRET_12345"
+            subprocess.run(["git", "tag", "-a", "fictional-v1", "-m", fabricated_secret], cwd=root, check=True)
+            run = subprocess.run(
+                [sys.executable, str(SCANNER), "--root", str(root), "--all-refs", "--json"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+            findings = json.loads(run.stdout)["findings"]
+            self.assertTrue(any(x["path"].startswith("<commit:") and x["rule"] == "provider-token" for x in findings))
+            self.assertTrue(any(x["path"].startswith("<tag:") and x["rule"] == "credential-assignment" for x in findings))
+            self.assertFalse(any(x["rule"] == "email-address" for x in findings))
+            self.assertNotIn(fabricated_token, run.stdout)
+            self.assertNotIn(fabricated_secret, run.stdout)
+        finally:
+            temporary.cleanup()
+
+    def test_email_in_commit_body_is_not_exempted(self) -> None:
+        temporary, root = self._repo()
+        try:
+            (root / "README.md").write_text("Invented fixture.\n", encoding="utf-8")
+            address = "fictional-person" + "@" + "example.invalid"
+            self._commit(root, "Synthetic contact " + address)
+            run = subprocess.run(
+                [sys.executable, str(SCANNER), "--root", str(root), "--json"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertTrue(any(x["rule"] == "email-address" for x in json.loads(run.stdout)["findings"]))
+            self.assertNotIn(address, run.stdout)
+        finally:
+            temporary.cleanup()
+
+    def test_nonexistent_history_ref_fails_closed(self) -> None:
+        temporary, root = self._repo()
+        try:
+            (root / "README.md").write_text("Invented fixture.\n", encoding="utf-8")
+            self._commit(root, "synthetic fixture")
+            run = subprocess.run(
+                [sys.executable, str(SCANNER), "--root", str(root), "--history-ref", "missing-fictional-ref", "--json"],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(run.returncode, 0)
+        finally:
+            temporary.cleanup()
+
 if __name__ == "__main__":
     unittest.main()

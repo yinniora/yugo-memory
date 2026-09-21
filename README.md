@@ -198,7 +198,7 @@ Before publishing, create an untracked denylist outside the repository and run:
 YUGO_MEMORY_PRIVATE_DENYLIST=/absolute/path/to/private-denylist.txt npm run release-check
 ```
 
-The gate validates code, runs tests, and scans the working tree plus every reachable Git blob across all branches and tags.
+The gate validates code, runs tests, and scans the working tree plus reachable file contents and commit/tag metadata across every locally available branch and tag. Fetch all remote branches and tags before running it. CI fetches full history and scans all available refs with public detection rules; the external private denylist remains mandatory for the local release gate and must never be exposed to pull requests. Organization-specific names, domains, commands, and phrases belong only in that external file. All published examples must use independently invented scenarios. GitHub discussions, release text, generated archives, and Actions logs require a separate publication review.
 
 ## License
 

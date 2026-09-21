@@ -30,8 +30,8 @@ def _patterns(extra_literals: tuple[str, ...] = ()) -> tuple[tuple[str, re.Patte
     users_path = "/" + "Us" + "ers/"
     workspace_path = "/mnt/" + "work" + "space/"
     oss_path = "/data/" + "oss"
-    # Organization-specific names belong in the external private denylist.
-    internal_domains = r"INVENTED_PRIVATE_HOST_SENTINEL"
+    # Organization-specific domains belong only in the external private denylist.
+    internal_domains = r"\b(?:[a-z0-9-]+\.)+(?:internal|corp|lan|local)\b"
     attachment_path = "\\.co" + "dex/attachments/"
     delegation = "<codex_" + "delegation>"
     browser_context = "<in-app-browser-" + "context"
@@ -44,16 +44,24 @@ def _patterns(extra_literals: tuple[str, ...] = ()) -> tuple[tuple[str, re.Patte
         ("raw-delegation", re.compile(re.escape(delegation), re.IGNORECASE)),
         ("raw-browser-context", re.compile(re.escape(browser_context), re.IGNORECASE)),
         ("real-rollout-id", re.compile(r"rollout-\d{4}-\d{2}-\d{2}T[^\s/]*-019[0-9a-f]{29,}")),
-        ("real-thread-id", re.compile(r"\b019[0-9a-f]{29,}\b")),
-        ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+        ("real-thread-id", re.compile(r"\b01[0-9a-f]{6}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24})\b", re.IGNORECASE)),
+        ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----")),
         ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\b")),
         (
             "credential-assignment",
             re.compile(
-                r"(?i)\b(?:password|passwd|private[_ -]?token|access[_ -]?token|api[_ -]?key|secret[_ -]?key)\b"
-                r"\s*(?:=|:)\s*[\"']?[A-Za-z0-9_./+:-]{12,}"
+                r"(?i)\b(?:password|passwd|private[_ -]?token|access[_ -]?token|api[_ -]?key|secret[_ -]?key|client[_ -]?secret)\b"
+                r"[\"']?\s*(?:=|:)\s*[\"']?[A-Za-z0-9_./+:-]{12,}"
             ),
         ),
+        ("provider-token", re.compile(
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}"
+            r"|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{30,}|pypi-[A-Za-z0-9_-]{30,}"
+            r"|sk-(?:(?:proj|svcacct|ant-api\d+)-)?[A-Za-z0-9_-]{20,}"
+            r"|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16}|LTAI[A-Za-z0-9]{12,}"
+            r"|AIza[A-Za-z0-9_-]{30,}|xox[baprs]-[A-Za-z0-9-]{15,}|hf_[A-Za-z0-9]{25,})\b"
+        )),
+        ("credential-url", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/\"']+:[^\s/\"']+@")),
         ("email-address", re.compile(r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])")),
     )
     return base + tuple(("private-denylist", re.compile(re.escape(item), re.IGNORECASE)) for item in extra_literals)
@@ -84,7 +92,15 @@ def _scan_bytes(
     text = raw.decode("utf-8", errors="replace")
     for number, line in enumerate(text.splitlines(), 1):
         for rule, pattern in patterns:
-            if pattern.search(line):
+            candidate = line
+            if rule == "email-address" and path.startswith(("<commit:", "<tag:")):
+                # Only reserved synthetic/GitHub privacy addresses in identity headers.
+                if line.startswith(("author ", "committer ", "tagger ")):
+                    candidate = re.sub(
+                        r"<[^<>\s]+@(?:users\.noreply\.github\.com|example\.invalid)>(?= \d+ [+-]\d{4}$)",
+                        "<public-identity>", line,
+                    )
+            if pattern.search(candidate):
                 findings.append(Finding(path, number, rule, revision))
     return findings
 
@@ -95,13 +111,13 @@ def scan_files(
     patterns: tuple[tuple[str, re.Pattern[str]], ...],
 ) -> list[Finding]:
     findings: list[Finding] = []
-    scanner = Path(__file__).resolve()
     for path in files:
-        if not path.is_file() or path.resolve() == scanner:
+        if not path.is_file():
             continue
         try:
             raw = path.read_bytes()
         except OSError:
+            findings.append(Finding(path.relative_to(root).as_posix(), 0, "unreadable-file"))
             continue
         findings.extend(_scan_bytes(path.relative_to(root).as_posix(), raw, patterns))
     return findings
@@ -112,8 +128,10 @@ def history_blobs(root: Path, refs: list[str]) -> list[tuple[str, str, bytes]]:
         return []
     run = _run_git(root, ["rev-list", "--objects", *refs], check=False)
     if run.returncode != 0:
-        # A brand-new repository has no HEAD yet; its working tree is still scanned.
-        return []
+        # Only an unborn repository may omit history; invalid refs fail closed.
+        if refs == ["HEAD"] and not all_refs(root):
+            return []
+        raise RuntimeError("Cannot enumerate requested Git history")
     objects: dict[str, str] = {}
     for raw_line in run.stdout.splitlines():
         oid, _, raw_path = raw_line.partition(b" ")
@@ -121,9 +139,11 @@ def history_blobs(root: Path, refs: list[str]) -> list[tuple[str, str, bytes]]:
     blobs: list[tuple[str, str, bytes]] = []
     for oid, path in objects.items():
         object_type = _run_git(root, ["cat-file", "-t", oid]).stdout.strip()
-        if object_type != b"blob":
+        if object_type not in (b"blob", b"commit", b"tag"):
             continue
-        blobs.append((path or f"<blob:{oid[:12]}>", oid, _run_git(root, ["cat-file", "blob", oid]).stdout))
+        kind = object_type.decode("ascii")
+        label = path if kind == "blob" else f"<{kind}:{oid[:12]}>"
+        blobs.append((label or f"<blob:{oid[:12]}>", oid, _run_git(root, ["cat-file", kind, oid]).stdout))
     return blobs
 
 
@@ -133,8 +153,6 @@ def scan_history(
 ) -> list[Finding]:
     findings: list[Finding] = []
     for path, oid, raw in blobs:
-        if path == "scripts/privacy-scan.py":
-            continue
         findings.extend(_scan_bytes(path, raw, patterns, oid))
     return findings
 
@@ -161,7 +179,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--denylist", type=Path, help="Untracked newline-delimited private phrases; values are never echoed")
     parser.add_argument("--history-ref", action="append", default=[], help="Git revision whose reachable blobs must be scanned")
-    parser.add_argument("--all-refs", action="store_true", help="Scan every local branch, remote-tracking branch, and tag")
+    parser.add_argument("--all-refs", action="store_true", help="Scan content and metadata reachable from all available branches and tags")
     args = parser.parse_args()
     root = args.root.resolve()
     patterns = _patterns(load_denylist(args.denylist))
@@ -173,7 +191,7 @@ def main() -> int:
     payload = {
         "passed": not findings,
         "files_scanned": len(files),
-        "history_blobs_scanned": len(blobs),
+        "history_objects_scanned": len(blobs),
         "history_refs": refs,
         "findings": [asdict(item) for item in findings],
     }
@@ -187,7 +205,7 @@ def main() -> int:
     else:
         print(
             f"privacy scan passed ({payload['files_scanned']} working-tree files, "
-            f"{payload['history_blobs_scanned']} historical blobs)"
+            f"{payload['history_objects_scanned']} historical objects)"
         )
     return 0 if not findings else 2
 

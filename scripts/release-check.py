@@ -37,6 +37,11 @@ def main() -> int:
         print("Refusing to publish: keep the private denylist outside the repository.", file=sys.stderr)
         return 2
 
+    if not any(line.strip() and not line.lstrip().startswith("#") and len(line.strip()) >= 4
+               for line in denylist.read_text(encoding="utf-8").splitlines()):
+        print("Refusing to publish: private denylist has no usable entries.", file=sys.stderr)
+        return 2
+
     run("npm", "run", "validate")
     run("npm", "test")
     run(
